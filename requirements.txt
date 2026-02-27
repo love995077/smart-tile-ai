@@ -1,0 +1,12 @@
+﻿fastapi
+uvicorn
+torch
+torchvision
+opencv-python
+pillow
+numpy
+python-multipart
+segment-anything
+rembg[cpu]
+transformers==5.2.0
+streamlit
