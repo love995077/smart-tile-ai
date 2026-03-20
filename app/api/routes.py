@@ -1,12 +1,15 @@
 from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import FileResponse
 import numpy as np
 from PIL import Image
+from sqlalchemy.orm import Session
+from fastapi import Depends
+from app.DB.database import get_db
+from app.models.product import Product, ProductImage
 import cv2
 import uuid
 import os
-import mimetypes
 
 # The AI foreground extractor
 from rembg import remove 
@@ -22,14 +25,11 @@ load_catalog()
 
 # --- HELPER 1: DYNAMIC ARCHITECTURAL GROUT GENERATOR ---
 def format_as_tile_with_grout(img_np, grout_color=(170, 170, 170)):
-    """Draws a crisp, realistic cement-grey border around the tile."""
     crop_px = 3
     h_orig, w_orig = img_np.shape[:2]
     if h_orig > crop_px*2 and w_orig > crop_px*2:
         img_np = img_np[crop_px:h_orig-crop_px, crop_px:w_orig-crop_px]
         
-    # THE FIX: Dynamic Grout Thickness (1.5% of tile height) 
-    # This guarantees the grout line scales perfectly whether the tile is huge or tiny!
     grout_thickness = max(2, int(img_np.shape[0] * 0.015))
         
     tiled_with_grout = cv2.copyMakeBorder(
@@ -97,7 +97,7 @@ def apply_wall_lighting(original_img, tiled_img, mask):
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
-# --- ENDPOINT 1: VISUALIZATION ---
+# --- ENDPOINT 1: VISUALIZATION (100% UNTOUCHED & SAFE) ---
 @router.post("/visualize/")
 async def visualize(
     room: UploadFile = File(...), 
@@ -156,19 +156,15 @@ async def visualize(
     paste_back_mask = cv2.erode(clean_protection, np.ones((5, 5), np.uint8), iterations=1)
     soft_paste_back = clean_mask_alpha(paste_back_mask, blur_size=5)
 
-    # 5. PROCESS FLOOR (THE PIPELINE FIX)
     if floor_tile:
         f_tile_img = Image.open(floor_tile.file).convert("RGB")
-        # We apply grout directly to the raw, high-definition tile upload!
         f_tile_np = format_as_tile_with_grout(np.array(f_tile_img))
 
         soft_floor = clean_mask_alpha(smooth_floor, blur_size=7)
-        # We pass your scale slider value directly into perspective.py!
         tiled_raw = apply_tiles(final_result, smooth_floor, f_tile_np, surface_type="floor", scale=floor_scale)
         tiled_lit = apply_floor_lighting(room_np, tiled_raw, smooth_floor)
         final_result = alpha_blend(final_result, tiled_lit, soft_floor)
 
-    # 6. PROCESS WALL (THE PIPELINE FIX)
     if wall_tile:
         w_tile_img = Image.open(wall_tile.file).convert("RGB")
         w_tile_np = format_as_tile_with_grout(np.array(w_tile_img))
@@ -185,76 +181,89 @@ async def visualize(
     return FileResponse(output_path)
 
 
-# --- ENDPOINT 2: VISUAL SEARCH (Color Histograms) ---
-@router.post("/search-tiles/", response_class=FileResponse)
-async def search_tiles(query_image: UploadFile = File(...)):
+# --- ENDPOINT 2: MULTI-SURFACE VISUAL SEARCH (SMART SEGMENTATION) ---
+@router.post("/search-tiles/")
+async def search_tiles(
+    request: Request, 
+    query_image: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
     try:
         query_img = Image.open(query_image.file).convert("RGB")
         room_np = np.array(query_img)
-        
-        best_filename = None
-        highest_score = -1.0
-        catalog_dir = "catalog_tiles"
 
-        def calculate_histogram_score(img1_np, img2_path):
-            try:
-                img2 = cv2.imread(img2_path)
-                if img2 is None: return -1.0
-                img1_bgr = cv2.cvtColor(img1_np, cv2.COLOR_RGB2BGR)
-                hsv1 = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2HSV)
-                hsv2 = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
-                hist1 = cv2.calcHist([hsv1], [0, 1], None, [50, 60], [0, 180, 0, 256])
-                hist2 = cv2.calcHist([hsv2], [0, 1], None, [50, 60], [0, 180, 0, 256])
-                cv2.normalize(hist1, hist1, alpha=1, norm_type=cv2.NORM_L1)
-                cv2.normalize(hist2, hist2, alpha=1, norm_type=cv2.NORM_L1)
-                distance = cv2.compareHist(hist1, hist2, cv2.HISTCMP_BHATTACHARYYA)
-                score = (1.0 - distance) * 100.0
-                return score
-            except Exception as e:
-                return -1.0
-
-        def search_and_update_best(crop_np):
-            nonlocal best_filename, highest_score
-            if not os.path.exists(catalog_dir): return
-            for filename in os.listdir(catalog_dir):
-                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                    filepath = os.path.join(catalog_dir, filename)
-                    score = calculate_histogram_score(crop_np, filepath)
-                    if score > highest_score:
-                        highest_score = score
-                        best_filename = filename
-
-        def extract_texture_swatch(img_np, mask, box_size=150):
+        def extract_swatch(img_np, mask, box_size=150):
             y_idx, x_idx = np.where(mask > 0)
             if len(y_idx) == 0: return None
             center_y, center_x = int(np.median(y_idx)), int(np.median(x_idx))
             h, w = img_np.shape[:2]
             y1, y2 = max(0, center_y - box_size), min(h, center_y + box_size)
             x1, x2 = max(0, center_x - box_size), min(w, center_x + box_size)
-            return img_np[y1:y2, x1:x2]
+            return Image.fromarray(img_np[y1:y2, x1:x2])
 
-        search_and_update_best(room_np)
-        try:
-            floor_mask = detect_surface(room_np, surface_type="floor")
-            floor_swatch = extract_texture_swatch(room_np, floor_mask)
-            if floor_swatch is not None: search_and_update_best(floor_swatch)
-        except Exception:
-            pass
+        base_url = str(request.base_url).rstrip("/")
+
+        def format_results(matches):
+            formatted = []
+            for match in matches:
+                filename = match['filename']
+                image_url = f"{base_url}/catalog/{filename}"
+                
+                product = db.query(Product).filter(Product.list_image == filename).first()
+                if not product:
+                    gallery_img = db.query(ProductImage).filter(ProductImage.product_image == filename).first()
+                    if gallery_img:
+                        product = gallery_img.product 
+
+                if product:
+                    formatted.append({
+                        "name": product.name,
+                        "price_per_sqft": float(product.price_per_sqft) if product.price_per_sqft else "Call for price",
+                        "category": product.category_slug,
+                        "product_link": f"/product/{product.slug}", 
+                        "image_url": image_url,
+                        "match_score": match['match_score']
+                    })
+                else:
+                    formatted.append({
+                        "name": "Unknown Tile (Not in DB)",
+                        "image_url": image_url,
+                        "match_score": match['match_score']
+                    })
+            return formatted
+
+        final_results = {
+            "wall_matches": [],
+            "floor_matches": [],
+            "overall_matches": []
+        }
+
+        # 1. SMART WALL DETECTION (Using SAM)
         try:
             wall_mask = detect_surface(room_np, surface_type="wall")
-            wall_swatch = extract_texture_swatch(room_np, wall_mask)
-            if wall_swatch is not None: search_and_update_best(wall_swatch)
-        except Exception:
-            pass
+            wall_swatch = extract_swatch(room_np, wall_mask)
+            if wall_swatch:
+                matches = find_matching_tiles(wall_swatch, top_n=3, min_score=10.0)
+                final_results["wall_matches"] = format_results(matches)
+        except Exception as e:
+            print(f"Wall detection skipped: {e}")
 
-        if not best_filename:
-            raise HTTPException(status_code=404, detail="No matching products found in catalog.")
+        # 2. SMART FLOOR DETECTION (Using SAM)
+        try:
+            floor_mask = detect_surface(room_np, surface_type="floor")
+            floor_swatch = extract_swatch(room_np, floor_mask)
+            if floor_swatch:
+                matches = find_matching_tiles(floor_swatch, top_n=3, min_score=10.0)
+                final_results["floor_matches"] = format_results(matches)
+        except Exception as e:
+            print(f"Floor detection skipped: {e}")
 
-        filepath = os.path.join(catalog_dir, best_filename)
-        content_type, _ = mimetypes.guess_type(filepath)
-        return FileResponse(filepath, media_type=content_type or "image/jpeg")
-        
-    except HTTPException:
-        raise
+        # 3. FALLBACK (If SAM can't clearly separate walls and floors)
+        if not final_results["wall_matches"] and not final_results["floor_matches"]:
+            overall_matches = find_matching_tiles(query_img, top_n=3, min_score=0.0)
+            final_results["overall_matches"] = format_results(overall_matches)
+
+        return final_results
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")

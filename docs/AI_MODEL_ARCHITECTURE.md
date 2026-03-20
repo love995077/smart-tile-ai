@@ -29,3 +29,15 @@
 
 
 ## Storage Space: The project will download approximately 1.2GB of weights from the Hugging Face Hub during the first execution.
+
+
+### three heavy AI models
+
+## Model 1: SegFormer-B0 * Task: Semantic Room Segmentation (Floor/Wall Detection).
+# Identifier: nvidia/segformer-b0-finetuned-ade-512-512
+
+## Model 2: CLIP (ViT-B/32) * Task: Visual Feature Extraction & Tile Matching.
+# Identifier: openai/clip-vit-base-patch32
+
+## Model 3: U2-Net * Task: Background Removal & Tile Cleaning.
+# Identifier: Integrated via the rembg library.
