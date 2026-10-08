@@ -1,11 +1,20 @@
-﻿fastapi
+# --- Backend (API & AI) ---
+fastapi
 uvicorn
+# CPU wheels (Docker / Hugging Face Spaces). For a local NVIDIA GPU install the CUDA build instead,
+# e.g.: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch --index-url https://download.pytorch.org/whl/cpu
 torchvision --index-url https://download.pytorch.org/whl/cpu
-opencv-python-headless
+# contrib build provides cv2.ximgproc (guided filter); do not install opencv-python(-headless) alongside it
+opencv-contrib-python-headless
 pillow
 numpy
 python-multipart
-segment-anything
-rembg[cpu]
-transformers==5.2.0
+transformers>=5.19.0
+huggingface_hub>=1.33.0
+timm
+mobile_sam @ git+https://github.com/ChaoningZhang/MobileSAM.git
+
+# --- Database ---
+sqlalchemy
+pymysql

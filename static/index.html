@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Tile AI — Visualizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+            display: ['"Instrument Serif"', 'ui-serif', 'Georgia', 'serif'],
+          },
+          colors: {
+            ink: { 950: '#0f1113', 900: '#16191c', 800: '#1f2327', 700: '#2b3036' },
+            accent: { 300: '#5eead4', 400: '#2dd4bf', 500: '#14b8a6', 600: '#0d9488', 700: '#0f766e' },
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    html, body { height: 100%; }
+    body { -webkit-font-smoothing: antialiased; }
+    .grain { background-image: radial-gradient(rgba(0,0,0,.035) 1px, transparent 1px); background-size: 3px 3px; }
+    .dropzone.drag { border-color: #14b8a6; background: rgba(20,184,166,.06); }
+    .seg button[aria-pressed="true"] { background: #fff; color: #16191c; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+    .tile-card[aria-selected="true"] { outline: 2px solid #14b8a6; outline-offset: 2px; }
+    input[type=range] { accent-color: #14b8a6; }
+    .shimmer { background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,.55) 50%, rgba(255,255,255,0) 100%); background-size: 200% 100%; animation: shimmer 1.6s linear infinite; }
+    @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+    .orbit { animation: spin 1.1s cubic-bezier(.5,.1,.5,.9) infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .scroll-thin::-webkit-scrollbar { width: 8px; }
+    .scroll-thin::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 8px; }
+    canvas { touch-action: none; }
+  </style>
+</head>
+<body class="bg-stone-50 text-ink-900 font-sans">
+
+<!-- ======================= SCREEN 1: LANDING ======================= -->
+<main id="screen-landing" class="min-h-full grid lg:grid-cols-2">
+  <section class="relative flex flex-col justify-between px-6 sm:px-12 xl:px-20 py-10 bg-white">
+    <header class="flex items-center gap-2.5">
+      <div class="h-8 w-8 rounded-lg bg-ink-900 grid place-items-center">
+        <div class="grid grid-cols-2 gap-0.5"><span class="h-2 w-2 bg-accent-400 rounded-[2px]"></span><span class="h-2 w-2 bg-white rounded-[2px]"></span><span class="h-2 w-2 bg-white rounded-[2px]"></span><span class="h-2 w-2 bg-accent-400 rounded-[2px]"></span></div>
+      </div>
+      <span class="font-semibold tracking-tight">Smart Tile AI</span>
+    </header>
+
+    <div class="max-w-xl py-12">
+      <p class="text-xs font-semibold uppercase tracking-[.18em] text-accent-700">Room visualizer</p>
+      <h1 class="font-display text-5xl sm:text-6xl leading-[1.02] mt-4">See the floor<br><em class="text-stone-500">before you lay it.</em></h1>
+      <p class="mt-5 text-stone-600 text-lg leading-relaxed">Upload a photo of your room, click the surface you want to change, and preview any tile with true-to-scale sizing, real shadows and reflections.</p>
+
+      <label id="dropzone" class="dropzone mt-9 flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed border-stone-300 px-6 py-12 text-center cursor-pointer transition-colors hover:border-accent-500 hover:bg-stone-50">
+        <input id="room-input" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only">
+        <div class="h-12 w-12 rounded-full bg-stone-100 grid place-items-center">
+          <svg class="h-6 w-6 text-stone-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.6"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0l-4 4m4-4l4 4M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        </div>
+        <div>
+          <p class="font-medium">Drop a room photo here</p>
+          <p class="text-sm text-stone-500 mt-1">or <span class="text-accent-700 font-medium underline underline-offset-2">browse your files</span> · JPG, PNG, WebP</p>
+        </div>
+      </label>
+      <p class="mt-4 text-xs text-stone-500">Tip: shoot at chest height with the floor clearly visible. Everything runs on this machine; photos never leave it.</p>
+    </div>
+
+    <ol class="grid grid-cols-3 gap-4 text-sm max-w-xl">
+      <li><span class="font-display text-2xl text-accent-600">01</span><p class="text-stone-600 mt-1">Click to select a floor or wall</p></li>
+      <li><span class="font-display text-2xl text-accent-600">02</span><p class="text-stone-600 mt-1">Pick a tile and its real size</p></li>
+      <li><span class="font-display text-2xl text-accent-600">03</span><p class="text-stone-600 mt-1">Render a photoreal preview</p></li>
+    </ol>
+  </section>
+
+  <section class="bg-stone-100 grain px-6 sm:px-12 xl:px-16 py-10 flex flex-col">
+    <div class="flex items-end justify-between">
+      <div>
+        <h2 class="font-display text-3xl">Or start with a demo room</h2>
+        <p class="text-sm text-stone-500 mt-1">Pre-loaded spaces to try the visualizer instantly.</p>
+      </div>
+    </div>
+    <div id="demo-grid" class="mt-8 grid grid-cols-2 gap-4 sm:gap-5 flex-1 content-start"></div>
+  </section>
+</main>
+
+<!-- ======================= SCREEN 2: EDITOR ======================= -->
+<div id="screen-editor" class="hidden h-full flex flex-col">
+  <header class="h-14 shrink-0 flex items-center justify-between px-4 sm:px-5 bg-white border-b border-stone-200">
+    <div class="flex items-center gap-3">
+      <button id="btn-home" class="flex items-center gap-2.5" title="Back to start">
+        <div class="h-7 w-7 rounded-md bg-ink-900 grid place-items-center">
+          <div class="grid grid-cols-2 gap-[2px]"><span class="h-[7px] w-[7px] bg-accent-400 rounded-[1px]"></span><span class="h-[7px] w-[7px] bg-white rounded-[1px]"></span><span class="h-[7px] w-[7px] bg-white rounded-[1px]"></span><span class="h-[7px] w-[7px] bg-accent-400 rounded-[1px]"></span></div>
+        </div>
+        <span class="font-semibold tracking-tight text-sm hidden sm:inline">Smart Tile AI</span>
+      </button>
+      <span class="h-5 w-px bg-stone-200"></span>
+      <span id="room-name" class="text-sm text-stone-500 truncate max-w-[40vw]">Room</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <button id="btn-new-room" class="text-sm px-3 py-1.5 rounded-lg hover:bg-stone-100 text-stone-700">New room</button>
+      <button id="btn-keep" class="hidden text-sm px-3 py-1.5 rounded-lg border border-stone-200 hover:bg-stone-50 text-stone-700" title="Keep this render and tile another surface on top of it">Tile another surface</button>
+      <a id="btn-download" class="hidden text-sm px-3 py-1.5 rounded-lg bg-ink-900 text-white hover:bg-ink-700" download="tile-visualization.jpg">Download</a>
+    </div>
+  </header>
+
+  <div class="flex-1 min-h-0 flex flex-col lg:flex-row">
+    <!-- Canvas stage -->
+    <section class="relative flex-1 min-h-[55vh] bg-ink-950 overflow-hidden">
+      <div id="stage" class="absolute inset-0 flex items-center justify-center p-4 sm:p-8">
+        <canvas id="canvas" class="rounded-lg shadow-2xl shadow-black/50 cursor-crosshair"></canvas>
+      </div>
+
+      <!-- floating toolbar -->
+      <div class="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-1 rounded-full bg-ink-900/85 backdrop-blur px-1.5 py-1.5 text-white text-xs shadow-lg ring-1 ring-white/10">
+        <div id="hint-edit" class="flex items-center gap-3 px-3">
+          <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"></span>Left-click include</span>
+          <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-rose-500 ring-2 ring-rose-500/30"></span>Right-click exclude</span>
+        </div>
+        <div id="hint-result" class="hidden px-3">Drag to compare before / after</div>
+        <span class="h-4 w-px bg-white/15"></span>
+        <button id="btn-undo" class="px-2.5 py-1 rounded-full hover:bg-white/10 disabled:opacity-40" title="Undo last point (Ctrl+Z)">Undo</button>
+        <button id="btn-clear" class="px-2.5 py-1 rounded-full hover:bg-white/10 disabled:opacity-40">Clear</button>
+        <button id="btn-view" class="hidden px-2.5 py-1 rounded-full bg-white/10 hover:bg-white/20">Edit selection</button>
+        <span id="seg-busy" class="hidden items-center gap-1.5 px-2.5 text-accent-300"><span class="h-3 w-3 rounded-full border-2 border-accent-300 border-t-transparent orbit"></span>Segmenting</span>
+      </div>
+
+      <div id="render-info" class="hidden absolute bottom-4 left-4 rounded-lg bg-ink-900/80 backdrop-blur text-[11px] text-stone-300 px-3 py-2 ring-1 ring-white/10"></div>
+
+      <!-- premium loading overlay -->
+      <div id="loading" class="hidden absolute inset-0 z-20 bg-ink-950/60 backdrop-blur-md grid place-items-center">
+        <div class="w-[min(360px,85%)] rounded-2xl bg-white/95 p-6 shadow-2xl">
+          <div class="flex items-center gap-4">
+            <div class="relative h-11 w-11">
+              <div class="absolute inset-0 rounded-full border-[3px] border-stone-200"></div>
+              <div class="absolute inset-0 rounded-full border-[3px] border-accent-500 border-t-transparent border-l-transparent orbit"></div>
+            </div>
+            <div>
+              <p class="font-semibold">Rendering surface</p>
+              <p id="loading-stage" class="text-sm text-stone-500 transition-opacity">Estimating room depth…</p>
+            </div>
+          </div>
+          <div class="mt-5 h-1.5 rounded-full bg-stone-100 overflow-hidden">
+            <div id="loading-bar" class="h-full w-0 rounded-full bg-accent-500 relative transition-[width] duration-700 ease-out"><div class="absolute inset-0 shimmer"></div></div>
+          </div>
+          <ul id="loading-steps" class="mt-4 space-y-1.5 text-xs text-stone-400"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sidebar -->
+    <aside class="w-full lg:w-[390px] shrink-0 bg-white border-l border-stone-200 flex flex-col min-h-0">
+      <div class="flex-1 overflow-y-auto scroll-thin px-5 py-5 space-y-7">
+
+        <section>
+          <div class="flex items-center justify-between">
+            <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">1 · Surface</h3>
+            <span id="mask-status" class="text-xs text-stone-400">No selection</span>
+          </div>
+          <p class="text-sm text-stone-600 mt-2">Click the floor or wall in the photo. Right-click on rugs, lamps or furniture to keep them out.</p>
+          <div class="mt-3">
+            <label class="text-xs text-stone-500">Surface type</label>
+            <div class="seg mt-1.5 grid grid-cols-3 gap-1 rounded-lg bg-stone-100 p-1 text-sm" role="group" id="surface-seg">
+              <button data-v="auto" aria-pressed="true" class="rounded-md py-1.5 text-stone-600">Auto</button>
+              <button data-v="floor" aria-pressed="false" class="rounded-md py-1.5 text-stone-600">Floor</button>
+              <button data-v="wall" aria-pressed="false" class="rounded-md py-1.5 text-stone-600">Wall</button>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <div class="flex items-center justify-between">
+            <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">2 · Tile</h3>
+            <label class="text-xs text-accent-700 font-medium cursor-pointer hover:underline">
+              Upload tile<input id="tile-input" type="file" accept="image/*" class="sr-only">
+            </label>
+          </div>
+          <div id="tile-grid" class="mt-3 grid grid-cols-4 gap-2"></div>
+          <p id="tile-name" class="mt-2 text-sm font-medium truncate">—</p>
+        </section>
+
+        <section>
+          <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">3 · Size &amp; layout</h3>
+          <div class="mt-3 grid grid-cols-[1fr_auto_1fr] items-end gap-2">
+            <label class="block">
+              <span class="text-xs text-stone-500">Width (mm)</span>
+              <input id="tile-w" type="number" min="10" max="5000" value="600" class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20 outline-none">
+            </label>
+            <button id="btn-swap" class="mb-1 h-8 w-8 grid place-items-center rounded-lg hover:bg-stone-100 text-stone-500" title="Swap width and height">⇄</button>
+            <label class="block">
+              <span class="text-xs text-stone-500">Height (mm)</span>
+              <input id="tile-h" type="number" min="10" max="5000" value="600" class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20 outline-none">
+            </label>
+          </div>
+          <div id="size-presets" class="mt-2.5 flex flex-wrap gap-1.5 text-xs"></div>
+          <div class="mt-5">
+            <div class="flex justify-between text-xs"><span class="text-stone-500">Scale</span><span id="scale-val" class="font-medium tabular-nums">1.00×</span></div>
+            <input id="scale" type="range" min="0.25" max="3" step="0.05" value="1" class="w-full mt-1.5">
+          </div>
+        </section>
+
+        <section>
+          <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">4 · Finish</h3>
+          <label class="mt-3 flex items-center justify-between rounded-xl border border-stone-200 px-4 py-3 cursor-pointer hover:bg-stone-50">
+            <span>
+              <span class="block text-sm font-medium">Glossy finish</span>
+              <span class="block text-xs text-stone-500">Polished reflections and specular highlights</span>
+            </span>
+            <span class="relative inline-flex">
+              <input id="glossy" type="checkbox" class="peer sr-only">
+              <span class="h-6 w-11 rounded-full bg-stone-300 peer-checked:bg-accent-500 transition-colors"></span>
+              <span class="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform peer-checked:translate-x-5"></span>
+            </span>
+          </label>
+        </section>
+
+        <section class="border-t border-stone-200 pt-5">
+          <button id="btn-search" class="w-full flex items-center justify-between text-left">
+            <span>
+              <span class="block text-sm font-medium">Find matching products</span>
+              <span class="block text-xs text-stone-500">Identify the tiles already in this photo from the catalog</span>
+            </span>
+            <span class="text-stone-400">→</span>
+          </button>
+          <div id="search-results" class="mt-3 space-y-4"></div>
+        </section>
+      </div>
+
+      <div class="p-4 border-t border-stone-200 bg-white">
+        <button id="btn-render" disabled class="group relative w-full overflow-hidden rounded-xl bg-ink-900 text-white py-3.5 font-medium shadow-lg shadow-ink-900/20 hover:bg-ink-800 disabled:bg-stone-300 disabled:shadow-none disabled:cursor-not-allowed transition-colors">
+          <span class="relative z-10">Render Photorealistic Surface</span>
+          <span class="absolute inset-0 opacity-0 group-hover:opacity-100 group-disabled:opacity-0 shimmer"></span>
+        </button>
+        <p id="render-hint" class="mt-2 text-center text-xs text-stone-400">Select a surface to enable rendering</p>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div id="toast" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-50 rounded-xl bg-ink-900 text-white text-sm px-4 py-3 shadow-2xl max-w-[90vw]"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

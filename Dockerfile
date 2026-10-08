@@ -4,10 +4,11 @@ FROM python:3.11-slim
 # 2. Set the working directory
 WORKDIR /code
 
-# 3. Install system dependencies required by OpenCV and Rembg
+# 3. Install system dependencies (OpenCV runtime libs; git for the MobileSAM package)
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Copy and install Python requirements

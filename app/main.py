@@ -1,14 +1,37 @@
+import os
+
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles # NEW IMPORT
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
 from app.api.routes import router
+
+for folder in ("catalog_tiles", "outputs", "static"):
+    os.makedirs(folder, exist_ok=True)
 
 app = FastAPI(title="Smart Tile AI API")
 
-# --- NEW: Serve your tile images so they can be seen in the browser ---
-# This makes your images available at http://localhost:8000/catalog/filename.jpg
-app.mount("/catalog", StaticFiles(directory="catalog_tiles"), name="catalog")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Render-Info"],
+)
 
 app.include_router(router)
+
+# Tile images, e.g. http://localhost:8000/catalog/marble.jpg
+app.mount("/catalog", StaticFiles(directory="catalog_tiles"), name="catalog")
+# Frontend assets (app.js, demo rooms)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse("static/index.html")
+
 
 if __name__ == "__main__":
     import uvicorn

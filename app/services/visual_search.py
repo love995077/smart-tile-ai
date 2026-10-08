@@ -1,19 +1,39 @@
-import torch
 import os
-from PIL import Image
-from transformers import CLIPProcessor, CLIPModel
+import threading
+
 import numpy as np
+from PIL import Image
 
-# Automatically use GPU if available, otherwise use CPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from app.config import CLIP_MODEL_ID, DEVICE, DTYPE
+from app.services.gpu import LazyModel, inference
 
-print("Loading Visual Search AI (CLIP)...")
-MODEL_ID = "openai/clip-vit-base-patch32"
-processor = CLIPProcessor.from_pretrained(MODEL_ID)
-model = CLIPModel.from_pretrained(MODEL_ID).to(device)
+
+def _load_clip():
+    from transformers import CLIPModel, CLIPProcessor
+    processor = CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
+    model = CLIPModel.from_pretrained(CLIP_MODEL_ID, dtype=DTYPE).to(DEVICE).eval()
+    return processor, model
+
+
+# Loaded on the first search, not at import time.
+_clip = LazyModel("Visual Search AI (CLIP)", _load_clip)
 
 CATALOG_FOLDER = "catalog_tiles"
 catalog_embeddings = {}
+_catalog_loaded = False
+_catalog_lock = threading.Lock()
+
+
+def _embed(image_pil):
+    processor, model = _clip.get()
+    with inference():
+        inputs = processor(images=image_pil.convert("RGB"), return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(DEVICE, dtype=DTYPE)
+        outputs = model.get_image_features(pixel_values=pixel_values)
+        features = outputs.pooler_output if hasattr(outputs, "pooler_output") else outputs
+        features = features.float()
+        features = features / features.norm(p=2, dim=-1, keepdim=True)
+        return features.cpu().numpy()
 
 # --- THE UPGRADED COLOR BRAIN (SHADOW-PROOF HSV) ---
 def get_color_fingerprint(image_pil):
@@ -37,11 +57,18 @@ def get_color_fingerprint(image_pil):
     return hist.flatten() / hist.sum()
 
 def load_catalog():
-    global catalog_embeddings
-    if not os.path.exists(CATALOG_FOLDER):
-        os.makedirs(CATALOG_FOLDER)
-        return
+    global _catalog_loaded
+    with _catalog_lock:
+        if _catalog_loaded:
+            return
+        _catalog_loaded = True
+        if not os.path.exists(CATALOG_FOLDER):
+            os.makedirs(CATALOG_FOLDER)
+            return
+        _index_catalog()
 
+
+def _index_catalog():
     print("Indexing catalog for Patterns AND True Colors...")
     
     for root, dirs, files in os.walk(CATALOG_FOLDER):
@@ -54,35 +81,27 @@ def load_catalog():
                     image = Image.open(filepath).convert("RGB")
                     
                     # 1. Extract the AI Pattern (CLIP)
-                    inputs = processor(images=image, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        outputs = model.get_image_features(**inputs)
-                        features = outputs.pooler_output if hasattr(outputs, "pooler_output") else outputs
-                        features = features / features.norm(p=2, dim=-1, keepdim=True)
+                    features = _embed(image)
                     
                     # 2. Extract the Shadow-Proof Color Fingerprint
                     color_fingerprint = get_color_fingerprint(image)
                     
                     # 3. Save BOTH to memory
                     catalog_embeddings[relative_name] = {
-                        "pattern": features.cpu().numpy(),
+                        "pattern": features,
                         "color": color_fingerprint
                     }
                 except Exception as e:
                     print(f"Error indexing {relative_name}: {e}")
 
 def find_matching_tiles(query_image_pil, top_n=1, min_score=30.0): 
+    load_catalog()
     if not catalog_embeddings:
         return []
 
     # 1. Process Query Image
-    inputs = processor(images=query_image_pil.convert("RGB"), return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model.get_image_features(**inputs)
-        query_features = outputs.pooler_output if hasattr(outputs, "pooler_output") else outputs
-        query_features = query_features / query_features.norm(p=2, dim=-1, keepdim=True)
-        query_features = query_features.cpu().numpy()
-        
+    query_features = _embed(query_image_pil)
+
     query_color = get_color_fingerprint(query_image_pil)
 
     results = []

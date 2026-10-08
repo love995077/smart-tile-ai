@@ -1,193 +1,170 @@
-from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Request
-from fastapi.responses import FileResponse
+import base64
+import json
+import os
+import uuid
+
+import cv2
 import numpy as np
-from PIL import Image
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from PIL import Image, ImageOps
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
-from fastapi import Depends
+
+from app.config import MAX_IMAGE_SIDE
 from app.DB.database import get_db
 from app.models.product import Product, ProductImage
-import cv2
-import uuid
-import os
-
-# The AI foreground extractor
-from rembg import remove 
-
+from app.services.render_engine import render_surface
+from app.services.sam_masking import build_alpha_matte, make_overlay
 from app.services.segmentation import detect_surface
-from app.services.perspective import apply_tiles
-from app.services.visual_search import load_catalog, find_matching_tiles
+from app.services.visual_search import CATALOG_FOLDER, find_matching_tiles
 
 router = APIRouter()
 
-# --- INITIALIZATION ---
-load_catalog()
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
-# --- HELPER 1: DYNAMIC ARCHITECTURAL GROUT GENERATOR ---
-def format_as_tile_with_grout(img_np, grout_color=(170, 170, 170)):
-    crop_px = 3
-    h_orig, w_orig = img_np.shape[:2]
-    if h_orig > crop_px*2 and w_orig > crop_px*2:
-        img_np = img_np[crop_px:h_orig-crop_px, crop_px:w_orig-crop_px]
-        
-    grout_thickness = max(2, int(img_np.shape[0] * 0.015))
-        
-    tiled_with_grout = cv2.copyMakeBorder(
-        img_np,
-        top=0, bottom=grout_thickness,
-        left=0, right=grout_thickness,
-        borderType=cv2.BORDER_CONSTANT,
-        value=grout_color
-    )
-    return tiled_with_grout
-
-# --- HELPER 2: ARCHITECTURAL "SANDPAPER" ---
-def smooth_architectural_mask(mask, kernel_size=15):
-    if mask is None or not np.any(mask): return mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    smoothed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_OPEN, kernel)
-    blurred = cv2.GaussianBlur(smoothed, (21, 21), 0)
-    _, thresholded = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    return thresholded
-
-def clean_mask_alpha(mask, blur_size=5):
-    if mask is None or not np.any(mask): return mask
-    blurred = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-    return blurred
-
-def alpha_blend(background, foreground, mask):
-    alpha = mask.astype(np.float32) / 255.0
-    if len(alpha.shape) == 2:
-        alpha = alpha[..., None]
-    blended = (foreground.astype(np.float32) * alpha) + (background.astype(np.float32) * (1.0 - alpha))
-    return np.clip(blended, 0, 255).astype(np.uint8)
-
-# --- HELPER 3: SEPARATE LIGHTING ENGINES ---
-def apply_floor_lighting(original_img, tiled_img, mask):
-    light_map = cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
-    light_map = cv2.medianBlur(light_map, 15)
-    light_map = cv2.GaussianBlur(light_map, (31, 31), 0)
-    
-    light_map_f = light_map.astype(np.float32) / 255.0
-    mean_brightness = np.mean(light_map_f[mask > 0]) if np.any(mask) else np.mean(light_map_f)
-    
-    normalized_light = ((light_map_f - mean_brightness) * 0.8) + 1.0
-    normalized_light = np.clip(normalized_light, 0.45, 1.1)
-    
-    light_map_3c = cv2.cvtColor(normalized_light, cv2.COLOR_GRAY2RGB)
-    tiled_float = tiled_img.astype(np.float32) / 255.0
-    blended = (tiled_float * light_map_3c) * 255.0
-    return np.clip(blended, 0, 255).astype(np.uint8)
-
-def apply_wall_lighting(original_img, tiled_img, mask):
-    light_map = cv2.cvtColor(original_img, cv2.COLOR_RGB2GRAY)
-    light_map = cv2.GaussianBlur(light_map, (45, 45), 0)
-    
-    light_map_f = light_map.astype(np.float32) / 255.0
-    mean_brightness = np.mean(light_map_f[mask > 0]) if np.any(mask) else np.mean(light_map_f)
-    mean_brightness += 1e-5
-    
-    normalized_light = light_map_f / mean_brightness
-    normalized_light = np.clip(normalized_light, 0.65, 1.05)
-    
-    light_map_3c = cv2.cvtColor(normalized_light, cv2.COLOR_GRAY2RGB)
-    tiled_float = tiled_img.astype(np.float32) / 255.0
-    blended = (tiled_float * light_map_3c) * 255.0
-    return np.clip(blended, 0, 255).astype(np.uint8)
+DB_OFFLINE = {"status": "error", "message": "Database is offline. Please start MySQL."}
 
 
-# --- ENDPOINT 1: VISUALIZATION (100% UNTOUCHED & SAFE) ---
-@router.post("/visualize/")
-async def visualize(
-    room: UploadFile = File(...), 
-    floor_tile: Optional[UploadFile] = File(None),
-    wall_tile: Optional[UploadFile] = File(None),
-    floor_scale: float = Form(1.0),
-    wall_scale: float = Form(1.0)
+# --- HELPERS ---
+# Endpoints are plain `def`, so FastAPI runs them in its threadpool and model
+# inference never blocks the event loop.
+
+def read_rgb(upload, max_side=None):
+    """Returns (RGB array, downscale factor applied)."""
+    try:
+        img = ImageOps.exif_transpose(Image.open(upload.file)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"'{upload.filename}' is not a readable image.")
+    factor = 1.0
+    if max_side and max(img.size) > max_side:
+        factor = max_side / max(img.size)
+        img = img.resize((round(img.width * factor), round(img.height * factor)), Image.LANCZOS)
+    return np.array(img), factor
+
+
+def read_mask(upload, shape):
+    """Alpha matte from a PNG: its alpha channel if it has one, else its grey levels."""
+    try:
+        img = Image.open(upload.file)
+    except Exception:
+        raise HTTPException(status_code=400, detail="mask_image is not a readable image.")
+    if img.mode in ("RGBA", "LA"):
+        arr = np.array(img.getchannel("A"))
+    else:
+        arr = np.array(img.convert("L"))
+    if arr.shape != shape:
+        arr = cv2.resize(arr, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+    return arr.astype(np.float32) / 255.0
+
+
+def parse_clicks(raw, name, factor=1.0):
+    """'[[x, y], ...]' or '[{"x":..,"y":..}, ...]' in uploaded-image pixel coords."""
+    try:
+        data = json.loads(raw or "[]")
+        points = [(float(p["x"]), float(p["y"])) if isinstance(p, dict) else (float(p[0]), float(p[1])) for p in data]
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{name} must be a JSON list of [x, y] points.")
+    return [(x * factor, y * factor) for x, y in points]
+
+
+def png_data_url(arr):
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if arr.ndim == 3 else arr)
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+# --- ENDPOINT 1: CLICK-TO-MASK (MobileSAM + ALPHA MATTING) ---
+@router.post("/api/get-mask")
+def get_mask(
+    room_image: UploadFile = File(...),
+    positive_clicks: str = Form("[]"),
+    negative_clicks: str = Form("[]"),
 ):
-    if not floor_tile and not wall_tile:
-        raise HTTPException(status_code=400, detail="Upload a tile image.")
+    """Returns the soft alpha matte (greyscale PNG, to send back to /api/apply-tile)
+    and a tinted overlay of the selection for display."""
+    room_np, factor = read_rgb(room_image, MAX_IMAGE_SIDE)
+    positive = parse_clicks(positive_clicks, "positive_clicks", factor)
+    negative = parse_clicks(negative_clicks, "negative_clicks", factor)
+    if not positive:
+        raise HTTPException(status_code=400, detail="Add at least one positive (left) click.")
 
-    os.makedirs("outputs", exist_ok=True)
-    room_img = Image.open(room.file).convert("RGB")
-    room_np = np.array(room_img)
-    final_result = room_np.copy()
+    alpha = build_alpha_matte(room_np, positive, negative)
+    return {
+        "width": int(room_np.shape[1]),
+        "height": int(room_np.shape[0]),
+        "coverage": round(float(alpha.mean()), 4),
+        "mask": png_data_url((alpha * 255).astype(np.uint8)),
+        "overlay": png_data_url(make_overlay(room_np, alpha)),
+    }
 
-    base_floor_raw = detect_surface(room_np, surface_type="floor")
-    base_wall_raw = detect_surface(room_np, surface_type="wall")
 
-    smooth_wall = smooth_architectural_mask(base_wall_raw, kernel_size=15)
-    smooth_floor = smooth_architectural_mask(base_floor_raw, kernel_size=15)
-    
-    if np.any(smooth_floor):
-        smooth_wall = cv2.bitwise_and(smooth_wall, cv2.bitwise_not(smooth_floor))
+# --- ENDPOINT 2: PHOTOREALISTIC TILE RENDER ---
+@router.post("/api/apply-tile")
+def apply_tile(
+    room_image: UploadFile = File(...),
+    tile_image: UploadFile = File(...),
+    mask_image: UploadFile = File(...),
+    tile_width: float = Form(600.0),
+    tile_height: float = Form(600.0),
+    scale: float = Form(1.0),
+    is_glossy: bool = Form(False),
+    surface_type: str = Form("auto"),
+    grout_mm: float = Form(2.0),
+):
+    """tile_width / tile_height are physical tile dimensions in millimetres.
+    surface_type is "auto", "floor" or "wall"."""
+    if not (10 <= tile_width <= 5000 and 10 <= tile_height <= 5000):
+        raise HTTPException(status_code=400, detail="Tile dimensions must be between 10 and 5000 mm.")
+
+    room_np, _ = read_rgb(room_image, MAX_IMAGE_SIDE)
+    tile_np, _ = read_rgb(tile_image, 2048)
+    alpha = read_mask(mask_image, room_np.shape[:2])
 
     try:
-        fg_mask_pil = remove(room_img, only_mask=True)
-        fg_mask = np.array(fg_mask_pil)
-        if len(fg_mask.shape) == 3: fg_mask = cv2.cvtColor(fg_mask, cv2.COLOR_RGB2GRAY)
-        _, fg_mask = cv2.threshold(fg_mask, 10, 255, cv2.THRESH_BINARY)
-        
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        clean_fg = np.zeros_like(fg_mask)
-        img_area = room_np.shape[0] * room_np.shape[1]
-        for c in contours:
-            if cv2.contourArea(c) < (img_area * 0.40): 
-                cv2.drawContours(clean_fg, [c], -1, 255, thickness=cv2.FILLED)
-        fg_mask = clean_fg
-    except Exception:
-        fg_mask = np.zeros(room_np.shape[:2], dtype=np.uint8)
+        result, info = render_surface(
+            room_np, tile_np, alpha,
+            tile_w_mm=tile_width, tile_h_mm=tile_height, scale=scale,
+            is_glossy=is_glossy, surface_type=surface_type.lower(),
+            grout_mm=max(0.0, min(grout_mm, 20.0)),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    hsv = cv2.cvtColor(room_np, cv2.COLOR_RGB2HSV)
-    h, s, v = cv2.split(hsv)
-    _, white_mask = cv2.threshold(v, 240, 255, cv2.THRESH_BINARY)
-    _, color_mask = cv2.threshold(s, 100, 255, cv2.THRESH_BINARY)
-    
-    global_protection = cv2.bitwise_or(fg_mask, white_mask)
-    global_protection = cv2.bitwise_or(global_protection, color_mask)
-    
-    contours, _ = cv2.findContours(global_protection, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    clean_protection = np.zeros_like(global_protection)
-    for c in contours:
-        if cv2.contourArea(c) > 300:
-            cv2.drawContours(clean_protection, [c], -1, 255, thickness=cv2.FILLED)
-
-    paste_back_mask = cv2.erode(clean_protection, np.ones((5, 5), np.uint8), iterations=1)
-    soft_paste_back = clean_mask_alpha(paste_back_mask, blur_size=5)
-
-    if floor_tile:
-        f_tile_img = Image.open(floor_tile.file).convert("RGB")
-        f_tile_np = format_as_tile_with_grout(np.array(f_tile_img))
-
-        soft_floor = clean_mask_alpha(smooth_floor, blur_size=7)
-        tiled_raw = apply_tiles(final_result, smooth_floor, f_tile_np, surface_type="floor", scale=floor_scale)
-        tiled_lit = apply_floor_lighting(room_np, tiled_raw, smooth_floor)
-        final_result = alpha_blend(final_result, tiled_lit, soft_floor)
-
-    if wall_tile:
-        w_tile_img = Image.open(wall_tile.file).convert("RGB")
-        w_tile_np = format_as_tile_with_grout(np.array(w_tile_img))
-
-        soft_wall = clean_mask_alpha(smooth_wall, blur_size=7)
-        tiled_raw = apply_tiles(final_result, smooth_wall, w_tile_np, surface_type="wall", scale=wall_scale)
-        tiled_lit = apply_wall_lighting(room_np, tiled_raw, smooth_wall)
-        final_result = alpha_blend(final_result, tiled_lit, soft_wall)
-
-    final_result = alpha_blend(final_result, room_np, soft_paste_back)
-
+    os.makedirs("outputs", exist_ok=True)
     output_path = f"outputs/{uuid.uuid4()}.jpg"
-    cv2.imwrite(output_path, cv2.cvtColor(final_result, cv2.COLOR_RGB2BGR))
-    return FileResponse(output_path)
+    cv2.imwrite(output_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 94])
+    return FileResponse(output_path, media_type="image/jpeg", headers={"X-Render-Info": json.dumps(info)})
 
 
-# --- ENDPOINT 2: MULTI-SURFACE VISUAL SEARCH (SMART SEGMENTATION) ---
+# --- CATALOG LISTING (for the frontend tile picker) ---
+@router.get("/api/catalog")
+def list_catalog():
+    tiles = []
+    if os.path.isdir(CATALOG_FOLDER):
+        for root, _, files in os.walk(CATALOG_FOLDER):
+            for filename in sorted(files):
+                if filename.lower().endswith(IMAGE_EXTS):
+                    rel = os.path.relpath(os.path.join(root, filename), CATALOG_FOLDER).replace("\\", "/")
+                    name = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ").strip().title()
+                    tiles.append({"name": name, "path": rel, "url": f"/catalog/{rel}"})
+    return tiles
+
+
+# --- ENDPOINT 3: MULTI-SURFACE VISUAL SEARCH (MobileSAM SWATCHES + CLIP) ---
 @router.post("/search-tiles/")
-async def search_tiles(
+def search_tiles(
     request: Request, 
     query_image: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
+    # Fail fast (before running MobileSAM + CLIP) when MySQL is not reachable.
+    try:
+        db.execute(text("SELECT 1"))
+    except OperationalError as e:
+        print(f"search-tiles: database unreachable: {e.orig}")
+        return JSONResponse(status_code=503, content=DB_OFFLINE)
+
     try:
         query_img = Image.open(query_image.file).convert("RGB")
         room_np = np.array(query_img)
@@ -238,32 +215,40 @@ async def search_tiles(
             "overall_matches": []
         }
 
-        # 1. SMART WALL DETECTION (Using SAM)
+        # 1. SMART WALL DETECTION (MobileSAM)
         try:
             wall_mask = detect_surface(room_np, surface_type="wall")
             wall_swatch = extract_swatch(room_np, wall_mask)
             if wall_swatch:
                 matches = find_matching_tiles(wall_swatch, top_n=3, min_score=10.0)
                 final_results["wall_matches"] = format_results(matches)
+        except OperationalError:
+            raise
         except Exception as e:
             print(f"Wall detection skipped: {e}")
 
-        # 2. SMART FLOOR DETECTION (Using SAM)
+        # 2. SMART FLOOR DETECTION (MobileSAM)
         try:
             floor_mask = detect_surface(room_np, surface_type="floor")
             floor_swatch = extract_swatch(room_np, floor_mask)
             if floor_swatch:
                 matches = find_matching_tiles(floor_swatch, top_n=3, min_score=10.0)
                 final_results["floor_matches"] = format_results(matches)
+        except OperationalError:
+            raise
         except Exception as e:
             print(f"Floor detection skipped: {e}")
 
-        # 3. FALLBACK (If SAM can't clearly separate walls and floors)
+        # 3. FALLBACK (If MobileSAM can't clearly separate walls and floors)
         if not final_results["wall_matches"] and not final_results["floor_matches"]:
             overall_matches = find_matching_tiles(query_img, top_n=3, min_score=0.0)
             final_results["overall_matches"] = format_results(overall_matches)
 
         return final_results
 
+    except OperationalError as e:
+        # MySQL went away mid-request.
+        print(f"search-tiles: database error: {e.orig}")
+        return JSONResponse(status_code=503, content=DB_OFFLINE)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
