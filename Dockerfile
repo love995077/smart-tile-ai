@@ -1,28 +1,37 @@
-# 1. Use a lightweight Python image
-FROM python:3.11-slim
+# 1. Lightweight Python image (pinned to bookworm for stable system packages; matches the local 3.12 venv)
+FROM python:3.12-slim-bookworm
+
+# Unbuffered logs (model-loading messages show up in `docker logs`); a fixed Hugging Face
+# cache path that docker-compose.yml persists in a volume, so weights download once.
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/code/.cache/huggingface
 
 # 2. Set the working directory
 WORKDIR /code
 
-# 3. Install system dependencies (OpenCV runtime libs; git for the MobileSAM package)
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+# 3. Install system dependencies (glib for OpenCV; git for the MobileSAM package)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. Copy and install Python requirements
+# 4. Copy and install Python requirements (CPU torch wheels; aarch64 and x86_64 both supported)
 COPY ./requirements.txt /code/requirements.txt
 RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
 
 # 5. Create necessary directories to prevent path errors
-RUN mkdir -p /code/catalog_tiles /code/uploads /code/outputs
+RUN mkdir -p /code/catalog_tiles /code/uploads /code/outputs /code/.cache/huggingface
 
-# 6. Copy your entire project into the container
+# 6. Copy the project into the container
 COPY . /code
 
-# 7. Expose the port Hugging Face requires
+# 7. Expose the port Hugging Face Spaces requires (docker-compose maps it to the host)
 EXPOSE 7860
 
-# 8. Start the FastAPI server on port 7860
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/catalog', timeout=4)" || exit 1
+
+# 8. Start the FastAPI server on port 7860. One worker: models live in process memory
+#    and inference is serialised by a lock, so extra workers would only duplicate RAM.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]

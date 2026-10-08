@@ -1,11 +1,14 @@
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 
 # 1. The Connection String
 # Format: mysql+pymysql://username:password@host:port/database_name
-# Default phpMyAdmin uses user 'root' and an empty password
-SQLALCHEMY_DATABASE_URL = "mysql+pymysql://root:@127.0.0.1:3306/bharat_ceramic"
+# Production sets DATABASE_URL (see .env / docker-compose.yml). The fallback is the
+# local phpMyAdmin default: user 'root' with an empty password.
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://root:@127.0.0.1:3306/bharat_ceramic")
 
 # 2. Create the Database Engine
 # pool_pre_ping drops dead pooled connections (e.g. after MySQL restarts);

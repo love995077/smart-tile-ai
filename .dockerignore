@@ -1,6 +1,15 @@
 .venv/
 .venv-1/
-__pycache__/
+**/__pycache__/
+*.py[cod]
 .git/
+.gitignore
+# Secrets come in at runtime through env_file, never baked into the image
+.env
+# Mounted as volumes by docker-compose.yml
 outputs/
 uploads/
+catalog_tiles/
+app/models/*.pth
+app/models/*.pt
+docs/

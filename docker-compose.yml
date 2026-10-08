@@ -1,0 +1,29 @@
+services:
+  smart-tile-ai:
+    build: .
+    image: smart-tile-ai:latest
+    container_name: smart-tile-ai
+    restart: unless-stopped
+    # Loopback only: Caddy (host networking) proxies visualizer.lovee.dpdns.org to
+    # localhost:8082, so the plain-HTTP port is never published on the public IP.
+    ports:
+      - "127.0.0.1:8082:7860"
+    env_file:
+      - .env
+    volumes:
+      - ./app/models:/code/app/models
+      - ./catalog_tiles:/code/catalog_tiles
+      - ./outputs:/code/outputs
+      - ./uploads:/code/uploads
+      # Hugging Face weights (MobileSAM, Depth Anything, CLIP), kept across rebuilds.
+      - hf_cache:/code/.cache/huggingface
+    # Leaves headroom for the other services on the host (3 models + torch peak about 3GB).
+    mem_limit: 5g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hf_cache:
