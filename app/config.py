@@ -14,5 +14,8 @@ DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 
 CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
 
+# COCO object detector for zero-click foreground exclusion (Apache-2.0, ~10M params).
+DETECTOR_MODEL_ID = "ustc-community/dfine-small-coco"
+
 # Room photos are downscaled to this long side before any processing.
 MAX_IMAGE_SIDE = 1600

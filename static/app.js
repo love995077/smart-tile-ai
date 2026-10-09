@@ -29,6 +29,7 @@ const state = {
   maskBlob: null, overlayImg: null, maskSeq: 0, maskTimer: null,
   tile: null,                            // { name, blob, url }
   surface: 'auto',
+  autoExclude: true, excludedSummary: {},
   resultImg: null, resultUrl: null, view: 'edit', split: 0.5, dragging: false,
   fit: { x: 0, y: 0, s: 1 },
 };
@@ -254,6 +255,7 @@ function moveSplit(e) {
 function resetSelection() {
   state.pos = []; state.neg = []; state.order = [];
   state.maskBlob = null; state.overlayImg = null; state.maskSeq++;
+  state.excludedSummary = {};
   updateMaskStatus();
 }
 
@@ -284,6 +286,7 @@ async function requestMask() {
   fd.append('room_image', state.roomBlob, 'room.jpg');
   fd.append('positive_clicks', JSON.stringify(state.pos));
   fd.append('negative_clicks', JSON.stringify(state.neg));
+  fd.append('auto_exclude', state.autoExclude);
   try {
     const res = await fetch(`${API}/api/get-mask`, { method: 'POST', body: fd });
     if (!res.ok) throw new Error(await apiError(res));
@@ -294,6 +297,7 @@ async function requestMask() {
     state.overlayImg = overlay;
     state.maskBlob = maskBlob;
     state.coverage = data.coverage;
+    state.excludedSummary = data.auto_excluded || {};
     draw();
   } catch (e) {
     if (seq === state.maskSeq) toast(`Segmentation failed: ${e.message}`);
@@ -303,7 +307,15 @@ async function requestMask() {
   }
 }
 
+function describeExcluded() {
+  const el = $('auto-excluded');
+  if (!state.autoExclude) { el.textContent = 'Off: only your right-clicks are excluded'; return; }
+  const parts = Object.entries(state.excludedSummary || {}).map(([label, n]) => `${n} ${label}${n > 1 ? 's' : ''}`);
+  el.textContent = parts.length ? `Cut out: ${parts.join(' · ')}` : 'Detected objects are outlined in rose';
+}
+
 function updateMaskStatus() {
+  describeExcluded();
   const n = state.pos.length + state.neg.length;
   $('btn-undo').disabled = !n;
   $('btn-clear').disabled = !n;
@@ -387,6 +399,11 @@ function bindControls() {
     $('tile-h').value = w;
   });
   $('scale').addEventListener('input', (e) => { $('scale-val').textContent = `${Number(e.target.value).toFixed(2)}×`; });
+
+  $('auto-exclude').addEventListener('change', (e) => {
+    state.autoExclude = e.target.checked;
+    if (state.pos.length) scheduleMask(); else updateMaskStatus();
+  });
 
   document.querySelectorAll('#surface-seg button').forEach((b) => b.addEventListener('click', () => {
     document.querySelectorAll('#surface-seg button').forEach((x) => x.setAttribute('aria-pressed', 'false'));

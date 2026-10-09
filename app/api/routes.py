@@ -80,22 +80,27 @@ def get_mask(
     room_image: UploadFile = File(...),
     positive_clicks: str = Form("[]"),
     negative_clicks: str = Form("[]"),
+    auto_exclude: bool = Form(True),
 ):
     """Returns the soft alpha matte (greyscale PNG, to send back to /api/apply-tile)
-    and a tinted overlay of the selection for display."""
+    and a tinted overlay of the selection for display.
+
+    auto_exclude: detected foreground objects (people, chairs, laptops, ...) are cut
+    out of the surface without any clicks; `auto_excluded` lists them by type."""
     room_np, factor = read_rgb(room_image, MAX_IMAGE_SIDE)
     positive = parse_clicks(positive_clicks, "positive_clicks", factor)
     negative = parse_clicks(negative_clicks, "negative_clicks", factor)
     if not positive:
         raise HTTPException(status_code=400, detail="Add at least one positive (left) click.")
 
-    alpha = build_alpha_matte(room_np, positive, negative)
+    alpha, info = build_alpha_matte(room_np, positive, negative, auto_exclude=auto_exclude)
     return {
         "width": int(room_np.shape[1]),
         "height": int(room_np.shape[0]),
         "coverage": round(float(alpha.mean()), 4),
+        "auto_excluded": info["objects"],
         "mask": png_data_url((alpha * 255).astype(np.uint8)),
-        "overlay": png_data_url(make_overlay(room_np, alpha)),
+        "overlay": png_data_url(make_overlay(room_np, alpha, info["excluded"])),
     }
 
 

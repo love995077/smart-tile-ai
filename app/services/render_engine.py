@@ -1,19 +1,26 @@
 """Photorealistic tile rendering.
 
 Pipeline (all arrays RGB):
-  1. Depth Anything V2 gives relative disparity. Over a planar surface, disparity
-     is an affine function of pixel position, so a robust plane fit gives the
-     surface orientation (the direction of the plane's horizon line).
-  2. Hough lines + Canny on and around the surface vote for vanishing points.
-     Those anchor where the horizon sits (the one thing monocular depth cannot
-     tell us, because its shift is unknown) and the grid rotation.
-  3. With the horizon and an assumed focal length, every pixel is cast onto the
-     3D plane, giving metric (u, v) coordinates. That per-pixel mesh-grid is
-     used to sample a tile texture sized in millimetres (with grout), mip-mapped
-     so distant tiles do not shimmer.
-  4. Lighting: LAB luminance, bilateral-filtered, splits shading (shadows and
-     highlights) from the old surface's paint/texture. That shading is
-     multiplied onto the new tiles in linear light.
+  1. Geometry. Depth Anything V2 gives relative disparity. Over a planar surface,
+     disparity is exactly an affine function of pixel position, so a RANSAC plane
+     fit in (x, y, disparity) space recovers the rigid plane (up to the depth
+     model's unknown shift) while ignoring clutter that leaked into the mask.
+     Camera roll comes from the room's vertical lines; walls are then forced
+     exactly vertical and floors exactly horizontal. Hough-line vanishing points
+     (or an eye-level prior) fix the remaining shift.
+  2. Every pixel is cast onto that single plane, giving metric (u, v) coordinates.
+     Tile courses are therefore straight lines by construction: no depth-driven warp.
+  3. Tiles: the tile photo (uniform borders auto-cropped) is sampled with
+     trilinear mip-mapping; grout lines are drawn analytically with exact
+     box-filter anti-aliasing, so they stay crisp, straight and moire-free from
+     the foreground to the horizon.
+  4. Lighting: luminance is resampled onto a top-down metric grid of the plane and
+     filtered there by physical size, which removes old-tile patterns smaller than
+     ~45 cm at every depth while keeping room-scale shadows and sun patches: the
+     light level comes from a linear-light local mean, crisp shadow edges from a
+     morphological alternating sequential filter. Floors get soft
+     contact shadows where objects meet them. Highlights are compressed so
+     sunlight never bleaches the tiles.
   5. Glossy mode adds a blurred, faded planar reflection of everything standing
      on the floor, plus specular sheen.
 """
@@ -33,6 +40,12 @@ MAX_WALL_PERSPECTIVE = 0.6    # walls: far edge at most 2.5x the near edge's dis
 WALL_VP_MAX_ANGLE_DEG = 30.0  # only near-horizontal segments can vote for a wall's vanishing point
 WALL_VP_EYE_BAND = 0.2        # ...and their crossing must lie within +-20% of image height of eye level
 HIGHLIGHT_HEADROOM = (0.5, 0.7)   # max extra brightening above average light: (matte, glossy)
+MAX_ROLL_DEG = 8.0            # camera roll estimated from vertical lines is clamped to this
+SHADING_FOOTPRINT_M = 0.45    # light/dark detail smaller than this on the real surface is old-tile texture
+SHADING_DETAIL_FLOOR = 0.12   # crisp light changes weaker than this (log units, ~12%) are old-surface tone, not light
+SHADING_GRID_CELLS = 640      # resolution of the top-down metric grid used for lighting
+CONTACT_SHADOW = (0.25, 0.07) # floors: (darkening right at an object's base, decay distance in metres)
+BEVEL = (0.10, 1.5)           # tile edges: (darkening next to the grout, width in mm)
 
 
 @dataclass
@@ -70,13 +83,56 @@ def surface_normals(disparity, f):
     return cv2.resize(n, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-def _fit_disparity_plane(disparity, mask_bin, normals, upright=False):
-    """Robust fit of disparity = a*x + b*y + c over the surface pixels.
+def estimate_roll(gray):
+    """Camera roll (radians) from the room's vertical lines: door frames, wall corners, furniture.
 
-    upright=True fixes b = 0. For a vertical wall seen by a level camera, inverse
-    depth does not change along an image column, so this forces the wall to be
-    vertical: its vertical grout lines stay vertical instead of picking up the
-    tilt of noisy monocular depth.
+    The returned angle is the tilt of true verticals in the image (positive = leaning
+    right going down). Lines near the image centre count most, because camera pitch
+    makes off-centre verticals lean. Returns 0 when the evidence is weak or inconsistent.
+    """
+    h, w = gray.shape
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    min_len = 0.08 * h
+    segs = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=int(min_len * 0.5),
+                           minLineLength=min_len, maxLineGap=0.01 * max(h, w))
+    if segs is None:
+        return 0.0
+    segs = segs.reshape(-1, 4).astype(np.float64)
+    dx, dy = segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]
+    flip = dy < 0
+    dx[flip], dy[flip] = -dx[flip], -dy[flip]
+    tilt = np.degrees(np.arctan2(dx, dy))
+    length = np.hypot(dx, dy)
+    keep = np.abs(tilt) < 12.0
+    if keep.sum() < 4 or length[keep].sum() < 0.6 * h:
+        return 0.0
+    xm = 0.5 * (segs[keep, 0] + segs[keep, 2])
+    weights = length[keep] * np.exp(-((xm - w / 2) / (0.35 * w)) ** 2)
+    t = tilt[keep]
+
+    def wmedian(vals):
+        order = np.argsort(vals)
+        cum = np.cumsum(weights[order])
+        return vals[order][np.searchsorted(cum, cum[-1] / 2)]
+
+    med = wmedian(t)
+    if wmedian(np.abs(t - med)) > 3.0 or abs(med) < 0.5:
+        return 0.0
+    return float(np.radians(np.clip(med, -MAX_ROLL_DEG, MAX_ROLL_DEG)))
+
+
+def _fit_disparity_plane(disparity, mask_bin, normals, axis=None):
+    """RANSAC plane fit of disparity = a*x + b*y + c over the surface pixels.
+
+    Depth Anything predicts affine-invariant inverse depth, and the inverse depth of a
+    planar surface is exactly affine in pixel position. So this is a rigid 3D plane fit
+    (up to the model's unknown scale and shift). RANSAC keeps clutter that leaked into
+    the mask (chair legs, bags, feet) from bending it; the inliers are refit by least squares.
+
+    axis: optional unit image direction the disparity gradient is constrained to. Walls
+    pass the roll-corrected horizontal, so they come out exactly vertical; floors pass the
+    roll-corrected vertical, so they come out exactly horizontal.
+    Returns (coef [a, b, c], fitted disparity at the sample points, median normal, inlier share).
     """
     ys, xs = np.nonzero(mask_bin)
     if len(xs) > 40000:
@@ -91,20 +147,42 @@ def _fit_disparity_plane(disparity, mask_bin, normals, upright=False):
         ys, xs = ys[on_plane], xs[on_plane]
 
     A = np.stack([xs, ys, np.ones_like(xs)], axis=1).astype(np.float64)
-    cols = [0, 2] if upright else [0, 1, 2]
     d = disparity[ys, xs].astype(np.float64)
-    keep = np.ones(len(d), dtype=bool)
-    coef = np.zeros(3)
-    for _ in range(4):
-        sol, *_ = np.linalg.lstsq(A[keep][:, cols], d[keep], rcond=None)
-        coef = np.zeros(3)
-        coef[cols] = sol
-        res = np.abs(A @ coef - d)
-        mad = np.median(res[keep]) + 1e-6
-        keep = res < 3.0 * 1.4826 * mad
-        if keep.sum() < 50:
+    if axis is None:
+        design = A
+    else:
+        design = np.stack([A[:, 0] * axis[0] + A[:, 1] * axis[1], A[:, 2]], axis=1)
+    n_par = design.shape[1]
+
+    def to_coef(sol):
+        if axis is None:
+            return np.asarray(sol, dtype=np.float64)
+        return np.array([sol[0] * axis[0], sol[0] * axis[1], sol[1]])
+
+    sol, *_ = np.linalg.lstsq(design, d, rcond=None)
+    resid = np.abs(design @ sol - d)
+    tau = float(np.clip(2.5 * 1.4826 * np.median(resid), 0.002, 0.05))
+    best, best_count = sol, int((resid < tau).sum())
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        idx = rng.choice(len(d), n_par, replace=False)
+        try:
+            cand = np.linalg.solve(design[idx], d[idx])
+        except np.linalg.LinAlgError:
+            continue
+        count = int((np.abs(design @ cand - d) < tau).sum())
+        if count > best_count:
+            best, best_count = cand, count
+
+    inliers = np.abs(design @ best - d) < tau
+    for _ in range(3):
+        if inliers.sum() < n_par + 10:
             break
-    return coef, A @ coef, med
+        best, *_ = np.linalg.lstsq(design[inliers], d[inliers], rcond=None)
+        resid = np.abs(design @ best - d)
+        inliers = resid < max(tau, 2.5 * 1.4826 * float(np.median(resid[inliers])))
+    coef = to_coef(best)
+    return coef, A @ coef, med, float(inliers.mean())
 
 
 def _classify_surface(median_normal, coef, mask_bin):
@@ -149,8 +227,7 @@ def _homogeneous_lines(segs):
     return lines, lengths, angles
 
 
-def _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near, wall_eye_row=None, image_h=None,
-                                         max_rho=0.97):
+def _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near, wall_frame=None, max_rho=0.97):
     """Picks the disparity shift t so the plane's horizon passes through the dominant vanishing point.
 
     Lines that are parallel in 3D and lie on the surface meet at a vanishing point on its
@@ -158,15 +235,18 @@ def _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near, wall_eye_row
     segments votes; the votes are histogrammed by the perspective strength they imply,
     and the strongest consistent cluster wins.
 
-    For walls (wall_eye_row set), only horizontal 3D lines (baseboards, window heads,
-    tile courses) carry the wall's vanishing point, and for a level camera they converge
-    at eye level. So only near-horizontal segments vote, and only crossings near the
-    eye-level row count. Window mullions, furniture legs and sofa edges, which made a
-    nearly frontal wall look like it was seen at a grazing angle, are ignored.
+    For walls (wall_frame = (cx, cy, across, down, image_h)), only horizontal 3D lines
+    (baseboards, window heads, tile courses) carry the wall's vanishing point, and they
+    converge at eye level. So only segments within WALL_VP_MAX_ANGLE_DEG of the
+    roll-corrected horizontal vote, and only crossings near the eye-level line count.
+    Window mullions, furniture legs and sofa edges, which made a nearly frontal wall
+    look like it was seen at a grazing angle, are ignored.
     """
-    if wall_eye_row is not None:
-        ang = np.degrees(np.arctan2(segs[:, 3] - segs[:, 1], segs[:, 2] - segs[:, 0])) % 180
-        segs = segs[np.minimum(ang, 180 - ang) <= WALL_VP_MAX_ANGLE_DEG]
+    if wall_frame is not None:
+        cx, cy, across, down, image_h = wall_frame
+        seg_dir = np.column_stack([segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]])
+        seg_dir /= np.linalg.norm(seg_dir, axis=1, keepdims=True) + 1e-9
+        segs = segs[np.abs(seg_dir @ across) >= np.cos(np.radians(WALL_VP_MAX_ANGLE_DEG))]
     if len(segs) < 3:
         return None
     a, b, c = coef
@@ -182,9 +262,9 @@ def _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near, wall_eye_row
     t = a * v[:, 0] / vz + b * v[:, 1] / vz + c
     rho = span / np.maximum(d_near - t, 1e-9)
     ok &= (t < d_far - 0.02 * span) & (rho > 0.05) & (rho < max_rho)
-    if wall_eye_row is not None:
-        vy = v[:, 1] / vz
-        ok &= np.abs(vy - wall_eye_row) < WALL_VP_EYE_BAND * image_h
+    if wall_frame is not None:
+        offset = (v[:, 0] / vz - cx) * down[0] + (v[:, 1] / vz - cy) * down[1]
+        ok &= np.abs(offset) < WALL_VP_EYE_BAND * image_h
     if ok.sum() < 3:
         return None
 
@@ -243,24 +323,26 @@ def _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy):
 def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     h, w = mask_bin.shape
     f, cx, cy = FOCAL_FACTOR * max(w, h), w / 2.0, h / 2.0
+    gray = cv2.cvtColor(room_np, cv2.COLOR_RGB2GRAY)
+    roll = estimate_roll(gray)
+    down = np.array([np.sin(roll), np.cos(roll)])      # image direction of gravity
+    across = np.array([np.cos(roll), -np.sin(roll)])   # image direction of level lines
     normals = surface_normals(disparity, f)
 
     k = max(3, int(0.01 * max(h, w)))
     eroded = cv2.erode(mask_bin, np.ones((k, k), np.uint8))
     fit_mask = eroded if eroded.sum() > 500 else mask_bin
-    coef, dhat, median_normal = _fit_disparity_plane(disparity, fit_mask, normals)
+    coef, _, median_normal, _ = _fit_disparity_plane(disparity, fit_mask, normals)
+    surface = surface_type if surface_type in ("floor", "wall") else _classify_surface(median_normal, coef, mask_bin)
+
+    # Rigid orientation: a wall's inverse depth may only change along level lines (it is
+    # vertical); a floor's only along the gravity direction (it is horizontal).
+    coef, dhat, _, inlier_share = _fit_disparity_plane(disparity, fit_mask, normals,
+                                                       axis=across if surface == "wall" else down)
     a, b, c = coef
     d_far, d_near = np.percentile(dhat, 1), np.percentile(dhat, 99)
     span = d_near - d_far
 
-    surface = surface_type if surface_type in ("floor", "wall") else _classify_surface(median_normal, coef, mask_bin)
-    if surface == "wall":
-        coef, dhat, _ = _fit_disparity_plane(disparity, fit_mask, normals, upright=True)
-        a, b, c = coef
-        d_far, d_near = np.percentile(dhat, 1), np.percentile(dhat, 99)
-        span = d_near - d_far
-
-    gray = cv2.cvtColor(room_np, cv2.COLOR_RGB2GRAY)
     kb = max(5, int(0.02 * max(h, w)))
     band = cv2.dilate(mask_bin, np.ones((kb, kb), np.uint8))
     segs = _detect_segments(gray, band)
@@ -273,8 +355,8 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
         # into a grazing-angle wall.
         wall_cap = float(np.clip(0.15 + 4.0 * span / max(d_near, 1e-6), 0.15, MAX_WALL_PERSPECTIVE))
         if surface == "wall":
-            t = _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near, wall_eye_row=cy, image_h=h,
-                                                     max_rho=wall_cap)
+            t = _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near,
+                                                     wall_frame=(cx, cy, across, down, h), max_rho=wall_cap)
         else:
             t = _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near)
         source = "vanishing lines"
@@ -296,8 +378,11 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     if t is not None:
         horizon = np.array([a, b, c - t])
     elif surface == "floor":
-        ys, _ = np.nonzero(mask_bin)
-        horizon = np.array([0.0, 1.0, -min(cy, ys.min() - 0.05 * h)])
+        # Level horizon (roll-corrected) through eye level, kept above the floor mask.
+        ys, xs = np.nonzero(mask_bin)
+        top = float(((xs - cx) * down[0] + (ys - cy) * down[1]).min())
+        offset = min(0.0, top - 0.05 * h)
+        horizon = np.array([down[0], down[1], -(down[0] * cx + down[1] * cy + offset)])
         source = "eye-level prior"
     else:
         horizon = np.array([0.0, 0.0, 1.0])  # line at infinity: plane faces the camera
@@ -309,9 +394,10 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     normal = np.array([f * horizon[0], f * horizon[1], cx * horizon[0] + cy * horizon[1] + horizon[2]])
     normal /= np.linalg.norm(normal)
 
-    refs = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])]
-    if surface != "floor":
-        refs.reverse()
+    # Walls: tile columns follow gravity (roll-corrected), so they line up with door frames.
+    # Floors: tile courses run away from the camera.
+    gravity = np.array([down[0], down[1], 0.0])
+    refs = [np.array([0.0, 0.0, 1.0]), gravity] if surface == "floor" else [gravity, np.array([0.0, 0.0, 1.0])]
     for ref in refs:
         e2 = ref - (ref @ normal) * normal
         if np.linalg.norm(e2) > 0.2:
@@ -342,6 +428,8 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
         "horizon_source": source,
         "line_segments": int(len(segs)),
         "grid_rotation_deg": round(float(np.degrees(rot)), 1),
+        "roll_deg": round(float(np.degrees(roll)), 1),
+        "plane_inliers": round(inlier_share, 3),
         "normal": [round(float(x), 3) for x in normal],
     }
     return PlaneGeometry(surface, normal, distance, e1, e2, f, cx, cy, info)
@@ -361,28 +449,95 @@ def plane_coordinates(geo, x0, y0, x1, y1):
 
 # --------------------------------------------------------------------------- tile texture
 
-def build_tile_texture(tile_np, tile_w_mm, tile_h_mm, grout_mm=2.0):
-    """Tile image resized to its physical aspect (about 1px per mm) with grout and a soft edge bevel."""
+def prepare_tile_image(tile_np, tol=18, max_trim=0.2):
+    """Crops uniform borders (white frames, photo background) off a catalog tile photo.
+
+    A product shot often has a flat white or grey frame around the tile. Left in, it
+    renders as a second, fake grout line around every tile. Rows/columns that are flat
+    and match the border colour are trimmed from each side (at most max_trim per side).
+    """
+    img = tile_np.astype(np.int16)
+    h, w = img.shape[:2]
+    if h < 16 or w < 16:
+        return tile_np
+    ring = np.concatenate([img[0], img[-1], img[:, 0], img[:, -1]])
+    border = np.median(ring, axis=0)
+
+    def flat(line):
+        return (np.abs(line - border).max(axis=1) < tol).mean() > 0.97 and line.std(axis=0).max() < 10
+
+    top, bottom, left, right = 0, 0, 0, 0
+    while top < h * max_trim and flat(img[top]):
+        top += 1
+    while bottom < h * max_trim and flat(img[h - 1 - bottom]):
+        bottom += 1
+    while left < w * max_trim and flat(img[:, left]):
+        left += 1
+    while right < w * max_trim and flat(img[:, w - 1 - right]):
+        right += 1
+    if top + bottom + left + right == 0:
+        return tile_np
+    return tile_np[top:h - bottom, left:w - right]
+
+
+def build_tile_texture(tile_np, tile_w_mm, tile_h_mm):
+    """Tile image resized to its physical aspect, about 1px per mm (grout is drawn analytically)."""
     ppm = min(2.0, 1024.0 / max(tile_w_mm, tile_h_mm))
     tw, th = max(8, int(round(tile_w_mm * ppm))), max(8, int(round(tile_h_mm * ppm)))
     interp = cv2.INTER_AREA if tile_np.shape[1] > tw else cv2.INTER_CUBIC
-    tex = cv2.resize(tile_np, (tw, th), interpolation=interp).astype(np.float32)
-
-    g = max(1, int(round(grout_mm * ppm)))
-    bevel = max(1, int(round(1.0 * ppm)))
-    tex[g:g + bevel, :] *= 1.06          # top edge catches light
-    tex[:, g:g + bevel] *= 1.03
-    tex[th - bevel:, :] *= 0.90          # bottom / right edges fall into shadow
-    tex[:, tw - bevel:] *= 0.93
-
-    # Grout picks up the tile's tint, recessed so slightly darker.
-    grout = (0.35 * tex.reshape(-1, 3).mean(0) + 0.65 * np.array([190.0, 186.0, 180.0])) * 0.72
-    tex[:g, :] = grout
-    tex[:, :g] = grout
-    return np.clip(tex, 0, 255)
+    return cv2.resize(tile_np, (tw, th), interpolation=interp).astype(np.float32)
 
 
-def sample_tiled(texture, s, t, lod_bias=-0.6):
+def _line_coverage(a, half, footprint):
+    """Exact box-filtered coverage of grout bands [k - half, k + half] (k integer) over a pixel.
+
+    a: tile-index coordinate at the pixel centre; footprint: the pixel's extent along a.
+    This is the analytic anti-aliasing of a grid: lines stay perfectly straight and keep
+    their true weight at any distance, fading to the average coverage (2 * half) once a
+    pixel spans more than a whole tile, where sampled lines would break into moire.
+    """
+    fw = np.maximum(footprint, 1e-6)
+    k = np.round(a)
+    lo, hi = a - fw / 2, a + fw / 2
+    cov = np.zeros_like(a)
+    for dk in (-1.0, 0.0, 1.0):
+        c = k + dk
+        cov += np.clip(np.minimum(hi, c + half) - np.maximum(lo, c - half), 0, None)
+    cov /= fw
+    far = np.clip(fw - 1.0, 0, 1)
+    return np.clip(cov * (1 - far) + 2 * half * far, 0, 1)
+
+
+def render_tile_layer(tile_img, a, b, tile_w_mm, tile_h_mm, grout_mm):
+    """RGB float32 tiles at tile-index coordinates (a, b): texture, analytic grout and edge bevel."""
+    texture = build_tile_texture(tile_img, tile_w_mm, tile_h_mm)
+    th, tw = texture.shape[:2]
+    rgb = sample_tiled(texture, a * tw, b * th)
+
+    # Pixel footprint along each tile axis (box extent of the pixel in tile units).
+    fa = np.abs(np.gradient(a, axis=1)) + np.abs(np.gradient(a, axis=0))
+    fb = np.abs(np.gradient(b, axis=1)) + np.abs(np.gradient(b, axis=0))
+    ha, hb = 0.5 * grout_mm / tile_w_mm, 0.5 * grout_mm / tile_h_mm
+
+    # Edge bevel: tiles darken slightly towards the grout; invisible once sub-pixel.
+    strength, width_mm = BEVEL
+    ea = np.maximum((np.abs(a - np.round(a)) - ha) * tile_w_mm, 0)
+    eb = np.maximum((np.abs(b - np.round(b)) - hb) * tile_h_mm, 0)
+    va = np.clip(width_mm / np.maximum(fa * tile_w_mm, 1e-6), 0, 1)
+    vb = np.clip(width_mm / np.maximum(fb * tile_h_mm, 1e-6), 0, 1)
+    dark = np.maximum(np.exp(-ea / width_mm) * va, np.exp(-eb / width_mm) * vb)
+    rgb *= (1.0 - strength * dark)[..., None].astype(np.float32)
+
+    if grout_mm <= 0:
+        return rgb
+    cov = 1.0 - (1.0 - _line_coverage(a, ha, fa)) * (1.0 - _line_coverage(b, hb, fb))
+    # Grout picks up the tile's tint and sits recessed, so slightly darker.
+    grout = (0.35 * texture.reshape(-1, 3).mean(0) + 0.65 * np.array([190.0, 186.0, 180.0])) * 0.72
+    cov = cov[..., None].astype(np.float32)
+    return rgb * (1 - cov) + grout.astype(np.float32) * cov
+
+
+def sample_tiled(texture, s, t, lod_bias=-0.3):
     """Samples an infinitely repeated texture at texel coords (s, t) with trilinear mip-mapping.
 
     The texel footprint per screen pixel comes from the coordinate derivatives, so tiles
@@ -427,54 +582,135 @@ def linear_to_srgb(x):
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1 / 2.4) - 0.055) * 255.0
 
 
-def _masked_blur(img, weight, sigma):
-    num = cv2.GaussianBlur(img * weight, (0, 0), sigma)
-    den = cv2.GaussianBlur(weight, (0, 0), sigma)
-    return num / np.maximum(den, 1e-4)
+def _fill_invalid(img, valid):
+    """Fills invalid cells from nearby valid ones (normalised convolution, coarse to fine)."""
+    out = img.astype(np.float32).copy()
+    filled = valid.copy()
+    vf = valid.astype(np.float32)
+    weighted = img.astype(np.float32) * vf
+    for sigma in (2, 6, 18, 54, 162):
+        num = cv2.GaussianBlur(weighted, (0, 0), sigma)
+        den = cv2.GaussianBlur(vf, (0, 0), sigma)
+        take = ~filled & (den > 1e-3)
+        out[take] = num[take] / den[take]
+        filled |= take
+    if (~filled).any():
+        out[~filled] = float(img[valid].mean()) if valid.any() else 0.0
+    return out
 
 
-def intrinsic_shading(room_np, alpha):
-    """Shading ratio map (1.0 = average light on the surface) for the selected surface.
+def _remove_small_features(img, size):
+    """Destroys light and dark features smaller than `size` cells, keeping larger regions intact.
 
-    Intrinsic split: luminance = albedo x shading. In LAB, an edge-preserving bilateral
-    filter on L keeps crisp shadow and highlight boundaries but flattens fine texture
-    (wood grain, old tile patterns). Busy textures such as checkerboards survive a
-    bilateral filter, so the crisp detail is faded out wherever edge density says
-    "texture" rather than "shadow", leaving only the smooth light falloff there.
+    An alternating sequential filter: at growing scales, a closing fills dark features
+    (black diamonds, grout lines, plank gaps) and an opening removes light ones (veins,
+    specks). Unlike blurring, it does not smear a strong pattern into a soft ghost, and
+    unlike a bilateral filter, a high-contrast pattern edge cannot survive it. A median and
+    a light Gaussian then clean up the blocky residue. Shadows and sun patches larger
+    than `size` keep their level and edges.
     """
-    h, w = alpha.shape
+    out = img.astype(np.float32)
+    k = 3
+    while True:
+        kk = min(k, size) | 1
+        se = cv2.getStructuringElement(cv2.MORPH_RECT, (kk, kk))
+        out = cv2.morphologyEx(cv2.morphologyEx(out, cv2.MORPH_CLOSE, se), cv2.MORPH_OPEN, se)
+        if kk >= size:
+            break
+        k = max(k + 2, int(k * 1.6))
+    lo, hi = float(out.min()), float(out.max())
+    q = ((out - lo) / max(hi - lo, 1e-6) * 255.0).astype(np.uint8)
+    q = cv2.medianBlur(q, max(3, (size // 2) | 1))
+    out = q.astype(np.float32) / 255.0 * (hi - lo) + lo
+    return cv2.GaussianBlur(out, (0, 0), max(1.0, size / 6.0))
+
+
+def _shading_from_grid(log_lum, size):
+    """Albedo-free shading (log) on the metric grid: two bands from two estimators.
+
+    Low band: the local mean of LINEAR light. A camera averages distant, unresolved
+    patterns in linear light too, so this level is the same near and far; the
+    morphological filter alone takes the near-field white level but the far-field
+    average, which fakes a darkening towards the horizon on checkerboards.
+    High band: the morphological filter's crisp edges (sun patches, shadow borders),
+    with changes under SHADING_DETAIL_FLOOR dropped as plank-to-plank tone.
+    """
+    lin_mean = np.log(cv2.GaussianBlur(np.exp(log_lum), (0, 0), max(1.0, size / 2.0)) + 1e-6)
+    low = cv2.GaussianBlur(lin_mean, (0, 0), max(1.0, float(size)))
+    crisp = _remove_small_features(log_lum, size)
+    high = crisp - cv2.GaussianBlur(crisp, (0, 0), max(1.0, float(size)))
+    high = np.sign(high) * np.maximum(np.abs(high) - SHADING_DETAIL_FLOOR, 0)
+    return (low + high).astype(np.float32)
+
+
+def illumination_map(room_np, alpha, geo, u, v, bbox):
+    """Shading ratio (1.0 = typical light on the surface) for the bbox, free of old-tile texture.
+
+    Intrinsic split: luminance = albedo x shading. Old tiles shrink with distance, so a
+    fixed image-space blur either leaves near-field patterns as ghosts or wipes out
+    far-field shadows. Here the photo's luminance is resampled onto a top-down metric
+    grid of the actual plane, so every feature appears at its true physical size; there
+    everything smaller than SHADING_FOOTPRINT_M is removed and room-scale light (window
+    falloff, furniture shadows, sun patches) is kept (see _shading_from_grid). The
+    result is mapped back per pixel.
+    """
+    x0, y0, x1, y1 = bbox
+    surface = alpha > 0.5
+    sub = surface[y0:y1, x0:x1]
+    if sub.sum() < 50:
+        return np.ones(u.shape, np.float32)
+
     L = cv2.cvtColor(room_np, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32) / 255.0
-    lum = np.power((L * 100.0 + 16.0) / 116.0, 3.0)          # linear relative luminance Y
-    log_lum = np.log(lum + 1e-3)
+    log_lum = np.log(np.power((L * 100.0 + 16.0) / 116.0, 3.0) + 1e-3).astype(np.float32)
 
-    s = min(1.0, 512.0 / max(h, w))
-    sw, sh = max(8, int(w * s)), max(8, int(h * s))
-    small = cv2.resize(log_lum, (sw, sh), interpolation=cv2.INTER_AREA)
-    m_small = cv2.resize(alpha, (sw, sh), interpolation=cv2.INTER_AREA)
+    us, vs = u[sub], v[sub]
+    u_lo, u_hi = np.percentile(us, [0.5, 99.5])
+    v_lo, v_hi = np.percentile(vs, [0.5, 99.5])
+    # Grid fine enough for crisp shadow edges, coarse enough that the footprint is <= 24 cells.
+    cell = max(max(u_hi - u_lo, v_hi - v_lo) / SHADING_GRID_CELLS, SHADING_FOOTPRINT_M / 24)
+    gw, gh = int((u_hi - u_lo) / cell) + 2, int((v_hi - v_lo) / cell) + 2
+    uu, vv = np.meshgrid(u_lo + cell * np.arange(gw), v_lo + cell * np.arange(gh))
+    pts = geo.distance * geo.normal + uu[..., None] * geo.e1 + vv[..., None] * geo.e2
+    z = pts[..., 2]
+    ahead = z > 1e-6
+    zs = np.where(ahead, z, 1.0)
+    map_x = np.where(ahead, geo.f * pts[..., 0] / zs + geo.cx, -10).astype(np.float32)
+    map_y = np.where(ahead, geo.f * pts[..., 1] / zs + geo.cy, -10).astype(np.float32)
 
-    crisp = small
-    for _ in range(3):
-        crisp = cv2.bilateralFilter(crisp, d=7, sigmaColor=0.35, sigmaSpace=4)
+    grid = cv2.remap(log_lum, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # Sample light only away from the mask border, where pixels can still be part
+    # object (a bright ceramic base, a dark shoe); the border is filled from the interior.
+    k = max(3, int(round(0.003 * max(alpha.shape))) | 1)
+    core = cv2.erode(surface.astype(np.uint8), np.ones((k, k), np.uint8))
+    if core.sum() < 0.5 * surface.sum():
+        core = surface.astype(np.uint8)
+    valid = cv2.remap(core.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.5
+    filtered = _shading_from_grid(_fill_invalid(grid, valid), max(3, int(round(SHADING_FOOTPRINT_M / cell))))
 
-    sigma = 0.04 * max(sw, sh)
-    base = _masked_blur(small, m_small + 1e-3, sigma)
-    # Old-surface albedo edges (plank-to-plank tone shifts) look like weak shadows; only
-    # strong, large-area luminance changes are kept at full strength.
-    detail = crisp - _masked_blur(crisp, m_small + 1e-3, sigma)
-    detail = np.clip(np.sign(detail) * np.maximum(np.abs(detail) - 0.08, 0) * 0.85, -1.2, 1.0)
-
-    small_gray = cv2.resize(cv2.cvtColor(room_np, cv2.COLOR_RGB2GRAY), (sw, sh), interpolation=cv2.INTER_AREA)
-    edges = cv2.Canny(cv2.GaussianBlur(small_gray, (3, 3), 0), 40, 100).astype(np.float32) / 255.0
-    win = max(5, int(0.04 * max(sw, sh)) | 1)
-    density = cv2.boxFilter(edges, -1, (win, win))
-    texture_free = np.clip(1.0 - (density - 0.03) / 0.07, 0.0, 1.0)
-
-    shading = base + detail * texture_free
-    shading = cv2.resize(shading, (w, h), interpolation=cv2.INTER_CUBIC)
-
-    inside = alpha > 0.5
-    ref = np.percentile(shading[inside], 60) if inside.any() else np.median(shading)
+    gx = ((u - u_lo) / cell).astype(np.float32)
+    gy = ((v - v_lo) / cell).astype(np.float32)
+    shading = cv2.remap(filtered, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    ref = np.percentile(shading[sub], 60)
     return np.clip(np.exp(shading - ref), 0.04, 3.0).astype(np.float32)
+
+
+def contact_shadow(alpha, u, v, bbox):
+    """Soft ambient occlusion where objects meet the floor (chair legs, sofa bases, feet, skirting).
+
+    The texture filter removes small dark blobs, real contact shadows included, so these
+    are rebuilt from geometry: darkening that decays with the metric distance to the
+    nearest non-floor pixel directly above (the object standing there).
+    """
+    x0, y0, x1, y1 = bbox
+    h = alpha.shape[0]
+    rows = np.arange(h, dtype=np.int32)[:, None]
+    axis = np.maximum.accumulate(np.where(alpha > 0.5, -1, rows), axis=0)[y0:y1, x0:x1]
+    d_px = (rows[y0:y1] - axis).astype(np.float32)
+    m_per_px = np.hypot(np.gradient(u, axis=0), np.gradient(v, axis=0)).astype(np.float32)
+    strength, decay = CONTACT_SHADOW
+    ao = 1.0 - strength * np.exp(-d_px * m_per_px / decay)
+    return np.where(axis >= 0, ao, 1.0).astype(np.float32)
 
 
 def compress_highlights(shading, headroom):
@@ -565,23 +801,26 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
 
     ys, xs = np.nonzero(alpha > 0.01)
     x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+    bbox = (x0, y0, x1, y1)
     u, v, view_cos = plane_coordinates(geo, x0, y0, x1, y1)
+
+    shading = illumination_map(room_np, alpha, geo, u, v, bbox)
+    if geo.surface == "floor":
+        shading *= contact_shadow(alpha, u, v, bbox)
 
     # Anchor the grid on the nearest part of the surface, so the foreground shows a whole tile.
     my, mx = np.nonzero(mask_bin[y0:y1, x0:x1])
     anchor = np.argmax(my) if geo.surface == "floor" else len(my) // 2
-    u -= u[my[anchor], mx[anchor]]
-    v -= v[my[anchor], mx[anchor]]
+    u0, v0 = u[my[anchor], mx[anchor]], v[my[anchor], mx[anchor]]
 
-    texture = build_tile_texture(tile_np, tile_w_mm, tile_h_mm, grout_mm)
-    th, tw = texture.shape[:2]
+    # Tile-index coordinates: integers are tile edges. Grout scales with the tile so the
+    # size slider keeps proportions.
     scale = max(0.05, float(scale))
-    s = (u * 1000.0 / (tile_w_mm * scale) + 0.5) * tw
-    t = (v * 1000.0 / (tile_h_mm * scale)) * th
-    tiles = sample_tiled(texture, s, t)
-    tiles = cv2.GaussianBlur(tiles, (0, 0), 0.6)   # match camera optics; also tames aliasing
-
-    shading = intrinsic_shading(room_np, alpha)[y0:y1, x0:x1]
+    tile_w, tile_h = tile_w_mm * scale, tile_h_mm * scale
+    a = (u - u0) * 1000.0 / tile_w + 0.5
+    b = (v - v0) * 1000.0 / tile_h
+    tiles = render_tile_layer(prepare_tile_image(tile_np), a, b, tile_w, tile_h, grout_mm * scale)
+    tiles = cv2.GaussianBlur(tiles, (0, 0), 0.5)   # match camera optics
     base = srgb_to_linear(tiles)
     if is_glossy:
         # More highlight headroom plus a capped white sheen where the room is brightest.
@@ -616,14 +855,23 @@ def composite(room, new, alpha):
     changes colour. Writing the pixel as I = (1 - a) * F + a * B_old and swapping
     B_old for the new surface gives I + a * (new - B_old), with B_old estimated
     from nearby fully-selected pixels.
+
+    That estimate is only meaningful where the old surface is locally uniform. On a
+    high-contrast old pattern (black/white checker) the local average is a grey that
+    no edge pixel actually contains, and the correction paints bright or dark smears
+    along object bases; there a plain alpha blend is used instead.
     """
     h, w = alpha.shape
     solid = (alpha > 0.95).astype(np.float32)
     sigma = max(1.5, 0.004 * max(h, w))
     den = np.maximum(cv2.GaussianBlur(solid, (0, 0), sigma), 1e-4)
     b_old = cv2.GaussianBlur(room * solid[..., None], (0, 0), sigma) / den[..., None]
+    sq = cv2.GaussianBlur(room * room * solid[..., None], (0, 0), sigma) / den[..., None]
+    spread = np.sqrt(np.maximum(sq - b_old * b_old, 0).mean(axis=-1))      # local std of the old surface
+    trust = np.clip((40.0 - spread) / 20.0, 0, 1)[..., None]               # uniform below ~20, patterned above ~40
     a = alpha[..., None]
     decontaminated = room + a * (new - b_old)
+    blended = room * (1 - a) + new * a
+    edge = np.where(a > 0.02, trust * decontaminated + (1 - trust) * blended, room)
     interior = np.clip((alpha - 0.9) / 0.08, 0, 1)[..., None]
-    edge = np.where(a > 0.02, decontaminated, room)
     return edge * (1 - interior) + new * interior

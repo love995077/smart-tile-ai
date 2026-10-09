@@ -90,6 +90,28 @@ def predict_logits(image_np, points, labels, require_points=None):
     return refined[0].astype(np.float32)
 
 
+def predict_box_masks(image_np, boxes, chunk=8):
+    """Binary masks (N x H x W bool) for xyxy pixel boxes.
+
+    A box is an unambiguous prompt, so one decoder pass per box suffices, and boxes are
+    decoded in batches against the cached image embedding.
+    """
+    h, w = image_np.shape[:2]
+    if len(boxes) == 0:
+        return np.zeros((0, h, w), dtype=bool)
+    predictor = _predictor.get()
+    out = []
+    with inference():
+        _set_image(predictor, image_np)
+        b = torch.as_tensor(np.asarray(boxes, dtype=np.float32), device=predictor.device)
+        b = predictor.transform.apply_boxes_torch(b, predictor.original_size)
+        for i in range(0, len(b), chunk):
+            masks, _, _ = predictor.predict_torch(point_coords=None, point_labels=None, boxes=b[i:i + chunk],
+                                                  multimask_output=False)
+            out.append(masks[:, 0].cpu().numpy())
+    return np.concatenate(out).astype(bool)
+
+
 def detect_surface(image_np, surface_type="floor"):
     """Heuristic floor / wall mask for visual search, prompted with fixed points.
 
