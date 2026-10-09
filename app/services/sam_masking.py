@@ -313,6 +313,12 @@ def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=T
     smooth_outline = (cv2.GaussianBlur(binary.astype(np.float32), (0, 0), 2.0) > 0.5).astype(np.float32)
     crisp = cv2.GaussianBlur(smooth_outline, (0, 0), 0.8)
     alpha = np.where(band > 0, follow * soft + (1.0 - follow) * crisp, binary.astype(np.float32))
+    # Keep the matte within ~2px of the outline on both sides. Next to a high-contrast old
+    # pattern (black/white checker) the guided filter follows the pattern's edges and can
+    # spread partial alpha onto neighbouring white objects (translucent tiles over a toilet
+    # base) or punch translucent holes into the floor.
+    bound = cv2.GaussianBlur(binary.astype(np.float32), (0, 0), 1.5)
+    alpha = np.where(binary > 0, np.maximum(alpha, bound), np.minimum(alpha, bound))
     alpha = _close_halo(image_np, binary, alpha, reach=max(6, int(round(max(h, w) * 0.009))))
     return cv2.GaussianBlur(alpha, (3, 3), 0).astype(np.float32), info
 

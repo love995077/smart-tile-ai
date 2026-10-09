@@ -283,7 +283,7 @@ def _horizon_shift_from_vanishing_points(segs, coef, d_far, d_near, wall_frame=N
     return d_near - span / rho_hat
 
 
-def _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy):
+def _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy, image_w=None):
     """Rotation (radians) that aligns the tile grid with the room's dominant lines.
 
     Each segment's vanishing point is where it crosses the horizon; back-projected,
@@ -312,10 +312,15 @@ def _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy):
     k = int(np.argmax(smooth))
     peak = (k + 0.5) * 2.0
     diff = np.abs((theta - peak + 45) % 90 - 45)
-    if weights[diff < 5].sum() < 0.35 * weights.sum():
+    # Straight (0 deg) unless the room's own lines agree strongly: at least half of the
+    # voting length, from long lines (>= 30% of the image width in total). Desk and chair
+    # edges in a cluttered office used to tilt grids by 7-13 degrees.
+    support = weights[diff < 5].sum()
+    if support < 0.5 * weights.sum() or (image_w and support < 0.3 * image_w):
         return 0.0
     rot = peak if peak <= 45 else peak - 90
-    if abs(rot) > MAX_FLOOR_ROTATION_DEG:
+    # Beyond the limit it is clutter; under 2 degrees it would only read as "almost straight".
+    if abs(rot) > MAX_FLOOR_ROTATION_DEG or abs(rot) < 2.0:
         return 0.0
     return float(np.radians(rot))
 
@@ -342,6 +347,10 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     a, b, c = coef
     d_far, d_near = np.percentile(dhat, 1), np.percentile(dhat, 99)
     span = d_near - d_far
+    if inlier_share < 0.35:
+        # Depth disagrees with itself over the mask (mirror, glass, clutter): don't trust the
+        # plane's slope; fall back to the eye-level prior (floors) or a frontal wall.
+        span = 0.0
 
     kb = max(5, int(0.02 * max(h, w)))
     band = cv2.dilate(mask_bin, np.ones((kb, kb), np.uint8))
@@ -412,7 +421,7 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     # depth or fronto-parallel). Tiles on a wall are laid level.
     rot = 0.0
     if surface == "floor" and t is not None:
-        rot = _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy)
+        rot = _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy, image_w=w)
     if rot:
         e1, e2 = np.cos(rot) * e1 + np.sin(rot) * e2, -np.sin(rot) * e1 + np.cos(rot) * e2
 
@@ -480,6 +489,27 @@ def prepare_tile_image(tile_np, tol=18, max_trim=0.2):
     return tile_np[top:h - bottom, left:w - right]
 
 
+def fit_tile_aspect(tile_np, tile_w_mm, tile_h_mm, tolerance=0.15):
+    """Centre-crops a tile photo to the physical tile's aspect ratio.
+
+    Stretching a 450x185 terrazzo photo onto a square 600x600 tile distorts every chip
+    2.4x. When the photo's aspect differs from the tile's by more than `tolerance`, the
+    largest centred crop with the right aspect is used instead.
+    """
+    h, w = tile_np.shape[:2]
+    target = tile_w_mm / tile_h_mm
+    actual = w / h
+    if abs(np.log(actual / target)) <= np.log(1 + tolerance):
+        return tile_np
+    if actual > target:
+        nw = max(1, int(round(h * target)))
+        x0 = (w - nw) // 2
+        return tile_np[:, x0:x0 + nw]
+    nh = max(1, int(round(w / target)))
+    y0 = (h - nh) // 2
+    return tile_np[y0:y0 + nh]
+
+
 def build_tile_texture(tile_np, tile_w_mm, tile_h_mm):
     """Tile image resized to its physical aspect, about 1px per mm (grout is drawn analytically)."""
     ppm = min(2.0, 1024.0 / max(tile_w_mm, tile_h_mm))
@@ -537,36 +567,52 @@ def render_tile_layer(tile_img, a, b, tile_w_mm, tile_h_mm, grout_mm):
     return rgb * (1 - cov) + grout.astype(np.float32) * cov
 
 
-def sample_tiled(texture, s, t, lod_bias=-0.3):
-    """Samples an infinitely repeated texture at texel coords (s, t) with trilinear mip-mapping.
+def sample_tiled(texture, s, t, lod_bias=-0.25, max_taps=8):
+    """Samples an infinitely repeated texture at texel coords (s, t) with anisotropic filtering.
 
-    The texel footprint per screen pixel comes from the coordinate derivatives, so tiles
-    near the horizon read as their averaged colour instead of shimmering grout noise.
+    A floor seen at an angle is squashed far more along one screen direction than the
+    other. Plain trilinear mip-mapping picks its blur from the squashed direction and
+    applies it in every direction, smearing fine texture (terrazzo chips, wood grain,
+    marble veins) into a flat grey. Here the mip level comes from the short axis of the
+    pixel footprint, and up to `max_taps` samples are averaged along the long axis, the
+    way GPUs do anisotropic filtering. Distant tiles still average out instead of
+    shimmering.
     """
     th, tw = texture.shape[:2]
-    jx = np.hypot(np.gradient(s, axis=1), np.gradient(t, axis=1))
-    jy = np.hypot(np.gradient(s, axis=0), np.gradient(t, axis=0))
-    footprint = np.maximum(np.maximum(jx, jy), 1e-6)
+    dsx, dtx = np.gradient(s, axis=1), np.gradient(t, axis=1)
+    dsy, dty = np.gradient(s, axis=0), np.gradient(t, axis=0)
+    lx, ly = np.hypot(dsx, dtx), np.hypot(dsy, dty)
+    x_major = lx >= ly
+    major = np.maximum(np.where(x_major, lx, ly), 1e-6)
+    minor = np.maximum(np.where(x_major, ly, lx), 1e-6)
+    n = np.clip(np.ceil(major / minor), 1, max_taps)
+    taps = int(np.clip(np.ceil(np.percentile(n, 95)), 1, max_taps))
+    ax_s = np.where(x_major, dsx, dsy)
+    ax_t = np.where(x_major, dtx, dty)
 
     levels = [texture]
     while min(levels[-1].shape[:2]) > 4:
         lh, lw = levels[-1].shape[:2]
         levels.append(cv2.resize(texture, (max(1, lw // 2), max(1, lh // 2)), interpolation=cv2.INTER_AREA))
 
-    lod = np.clip(np.log2(footprint) + lod_bias, 0, len(levels) - 1)
+    lod = np.clip(np.log2(major / n) + lod_bias, 0, len(levels) - 1)
     lo = np.floor(lod).astype(np.int32)
     frac = (lod - lo).astype(np.float32)
 
+    offsets = [((k + 0.5) / taps - 0.5) for k in range(taps)]
+    tap_coords = [(np.mod((s + o * ax_s) / tw, 1.0), np.mod((t + o * ax_t) / th, 1.0)) for o in offsets]
+
     out = np.zeros(s.shape + (3,), dtype=np.float32)
-    s_unit, t_unit = np.mod(s / tw, 1.0), np.mod(t / th, 1.0)
     for k, lvl in enumerate(levels):
         weight = np.where(lo == k, 1 - frac, 0) + np.where(lo + 1 == k, frac, 0)
         if not weight.any():
             continue
         lh, lw = lvl.shape[:2]
-        sample = cv2.remap(lvl, (s_unit * lw).astype(np.float32), (t_unit * lh).astype(np.float32),
-                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-        out += sample * weight[..., None].astype(np.float32)
+        acc = np.zeros(s.shape + (3,), dtype=np.float32)
+        for su, tu in tap_coords:
+            acc += cv2.remap(lvl, (su * lw).astype(np.float32), (tu * lh).astype(np.float32),
+                             cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+        out += (acc / len(tap_coords)) * weight[..., None].astype(np.float32)
     return out
 
 
@@ -725,6 +771,37 @@ def compress_highlights(shading, headroom):
     return np.where(shading > 1.0, 1.0 + headroom * np.tanh(over / headroom), shading).astype(np.float32)
 
 
+def scene_exposure(room_np):
+    """How far the photo is under-exposed (1.0 = normally exposed, down to 0.25).
+
+    Shading is normalised to the surface's own typical light, so on its own a new tile in
+    a dark, under-exposed photo would render at full brightness and glow. The photo's
+    near-white level (97th percentile of linear luminance) sets the overall exposure;
+    normally exposed photos are left untouched (range 0.05-1).
+    """
+    lum = srgb_to_linear(cv2.cvtColor(room_np, cv2.COLOR_RGB2GRAY).astype(np.float32))
+    return float(np.clip(np.percentile(lum, 97) / 0.6, 0.05, 1.0))
+
+
+def tone_map(lit, knee=0.65):
+    """Filmic shoulder on luminance only, so bright, colourful tiles keep their colour.
+
+    Compressing each RGB channel separately pushes bright colours towards white and
+    washes out a tile's pattern. Here luminance is compressed and RGB scaled with it;
+    only a colour that would still exceed 1.0 is desaturated just enough to fit.
+    """
+    lum = 0.2126 * lit[..., 0] + 0.7152 * lit[..., 1] + 0.0722 * lit[..., 2]
+    target = _soft_clip(lum, knee)
+    out = lit * (target / np.maximum(lum, 1e-6))[..., None]
+    peak = out.max(axis=-1)
+    over = peak > 1.0
+    if over.any():
+        t = target[over][..., None]
+        k = ((1.0 - t) / np.maximum(peak[over] - t[..., 0], 1e-6)[..., None])
+        out[over] = t + (out[over] - t) * np.clip(k, 0, 1)
+    return np.clip(out, 0, 1)
+
+
 def _soft_clip(x, knee=0.8):
     over = x > knee
     out = x.copy()
@@ -819,9 +896,10 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
     tile_w, tile_h = tile_w_mm * scale, tile_h_mm * scale
     a = (u - u0) * 1000.0 / tile_w + 0.5
     b = (v - v0) * 1000.0 / tile_h
-    tiles = render_tile_layer(prepare_tile_image(tile_np), a, b, tile_w, tile_h, grout_mm * scale)
-    tiles = cv2.GaussianBlur(tiles, (0, 0), 0.5)   # match camera optics
-    base = srgb_to_linear(tiles)
+    tile_img = fit_tile_aspect(prepare_tile_image(tile_np), tile_w_mm, tile_h_mm)
+    tiles = render_tile_layer(tile_img, a, b, tile_w, tile_h, grout_mm * scale)
+    tiles = cv2.GaussianBlur(tiles, (0, 0), 0.35)   # a touch of camera optics; filtering handles aliasing
+    base = srgb_to_linear(tiles) * scene_exposure(room_np)
     if is_glossy:
         # More highlight headroom plus a capped white sheen where the room is brightest.
         lit_shading = compress_highlights(shading, HIGHLIGHT_HEADROOM[1])
@@ -829,8 +907,9 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
         lit = base * lit_shading[..., None] + sheen[..., None]
     else:
         lit = base * compress_highlights(shading, HIGHLIGHT_HEADROOM[0])[..., None]
-    # Filmic shoulder from 0.65 (linear): bright tiles in sun roll off instead of clipping.
-    out = linear_to_srgb(_soft_clip(lit, knee=0.65))
+    # Multiply blend in linear light keeps the tile's own texture; the filmic shoulder on
+    # luminance (from 0.65) rolls off sunlit highlights without bleaching colour.
+    out = linear_to_srgb(tone_map(lit, knee=0.65))
 
     sigma_n = min(4.0, _noise_sigma(cv2.cvtColor(room_np, cv2.COLOR_RGB2GRAY)))
     if sigma_n > 0.3:
