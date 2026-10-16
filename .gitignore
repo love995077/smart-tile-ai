@@ -8,8 +8,7 @@ app/models/*.pt
 *.bin
 *.pb
 
-# Image folders (catalog, uploads, AI outputs)
-catalog_tiles/
+# Image folders (uploads, AI outputs). catalog_tiles/ is tracked: it is the curated tile catalog.
 outputs/
 uploads/
 tiles/

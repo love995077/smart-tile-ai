@@ -1,3 +1,4 @@
+import mimetypes
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -13,6 +14,10 @@ from app.services.visual_search import CATALOG_FOLDER
 
 for folder in ("catalog_tiles", "outputs", "static"):
     os.makedirs(folder, exist_ok=True)
+
+# Most catalog tiles are WebP. Python 3.12's built-in table lacks it, so the slim Docker
+# image served them as application/octet-stream (and Windows' registry as text/plain).
+mimetypes.add_type("image/webp", ".webp")
 
 @asynccontextmanager
 async def lifespan(_app):
