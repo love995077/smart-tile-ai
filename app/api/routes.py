@@ -15,7 +15,9 @@ from sqlalchemy.orm import Session
 from app.config import MAX_IMAGE_SIDE
 from app.DB.database import get_db
 from app.models.product import Product, ProductImage
-from app.services.render_engine import render_surface
+from app.services.color_harmony import recommend
+from app.services.quality_advisor import assess_quality
+from app.services.render_engine import MOODS, ORIENTATIONS, PATTERNS, render_surface
 from app.services.sam_masking import build_alpha_matte, make_overlay
 from app.services.segmentation import detect_surface
 from app.services.visual_search import CATALOG_FOLDER, find_matching_tiles
@@ -66,7 +68,22 @@ def parse_clicks(raw, name, factor=1.0):
         points = [(float(p["x"]), float(p["y"])) if isinstance(p, dict) else (float(p[0]), float(p[1])) for p in data]
     except Exception:
         raise HTTPException(status_code=400, detail=f"{name} must be a JSON list of [x, y] points.")
+    if not all(np.isfinite(x) and np.isfinite(y) for x, y in points):
+        raise HTTPException(status_code=400, detail=f"{name} must contain finite coordinates.")
+    if len(points) > 200:
+        raise HTTPException(status_code=400, detail=f"{name}: at most 200 points.")
     return [(x * factor, y * factor) for x, y in points]
+
+
+def parse_hex_color(value):
+    """'#RRGGBB' / 'RRGGBB' -> (r, g, b); 'auto' or empty -> None."""
+    value = (value or "").strip().lower()
+    if value in ("", "auto"):
+        return None
+    hexpart = value[1:] if value.startswith("#") else value
+    if len(hexpart) != 6 or any(c not in "0123456789abcdef" for c in hexpart):
+        raise HTTPException(status_code=400, detail="grout_color must be a hex colour like #B8B8B4, or 'auto'.")
+    return tuple(int(hexpart[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def png_data_url(arr):
@@ -81,24 +98,27 @@ def get_mask(
     positive_clicks: str = Form("[]"),
     negative_clicks: str = Form("[]"),
     auto_exclude: bool = Form(True),
+    straighten: bool = Form(True),
 ):
     """Returns the soft alpha matte (greyscale PNG, to send back to /api/apply-tile)
     and a tinted overlay of the selection for display.
 
     auto_exclude: detected foreground objects (people, chairs, laptops, ...) are cut
-    out of the surface without any clicks; `auto_excluded` lists them by type."""
+    out of the surface without any clicks; `auto_excluded` lists them by type.
+    straighten: ragged floor-wall / wall-ceiling junctions are snapped to straight lines."""
     room_np, factor = read_rgb(room_image, MAX_IMAGE_SIDE)
     positive = parse_clicks(positive_clicks, "positive_clicks", factor)
     negative = parse_clicks(negative_clicks, "negative_clicks", factor)
     if not positive:
         raise HTTPException(status_code=400, detail="Add at least one positive (left) click.")
 
-    alpha, info = build_alpha_matte(room_np, positive, negative, auto_exclude=auto_exclude)
+    alpha, info = build_alpha_matte(room_np, positive, negative, auto_exclude=auto_exclude, straighten=straighten)
     return {
         "width": int(room_np.shape[1]),
         "height": int(room_np.shape[0]),
         "coverage": round(float(alpha.mean()), 4),
         "auto_excluded": info["objects"],
+        "straightened_edges": int(info.get("straightened_edges", 0)),
         "mask": png_data_url((alpha * 255).astype(np.uint8)),
         "overlay": png_data_url(make_overlay(room_np, alpha, info["excluded"])),
     }
@@ -116,11 +136,29 @@ def apply_tile(
     is_glossy: bool = Form(False),
     surface_type: str = Form("auto"),
     grout_mm: float = Form(2.0),
+    pattern: str = Form("standard"),
+    orientation: float = Form(0.0),
+    grout_color: str = Form("auto"),
+    lighting: str = Form("natural"),
 ):
     """tile_width / tile_height are physical tile dimensions in millimetres.
-    surface_type is "auto", "floor" or "wall"."""
+    surface_type is "auto", "floor" or "wall".
+    pattern: standard | brick | herringbone | checkerboard. orientation: 0, 90 or 45 degrees.
+    grout_color: "#RRGGBB", or "auto" for a neutral grout tinted by the tile.
+    lighting: natural | warm (3000K evening) | cool (6500K daylight)."""
+    if not all(np.isfinite([tile_width, tile_height, scale, grout_mm, orientation])):
+        raise HTTPException(status_code=400, detail="Numeric parameters must be finite numbers.")
     if not (10 <= tile_width <= 5000 and 10 <= tile_height <= 5000):
         raise HTTPException(status_code=400, detail="Tile dimensions must be between 10 and 5000 mm.")
+    pattern = pattern.strip().lower()
+    if pattern not in PATTERNS:
+        raise HTTPException(status_code=400, detail=f"pattern must be one of: {', '.join(PATTERNS)}.")
+    if float(orientation) not in ORIENTATIONS:
+        raise HTTPException(status_code=400, detail="orientation must be 0, 90 or 45.")
+    lighting = lighting.strip().lower()
+    if lighting not in MOODS:
+        raise HTTPException(status_code=400, detail=f"lighting must be one of: {', '.join(MOODS)}.")
+    grout_rgb = parse_hex_color(grout_color)
 
     room_np, _ = read_rgb(room_image, MAX_IMAGE_SIDE)
     tile_np, _ = read_rgb(tile_image, 2048)
@@ -129,9 +167,10 @@ def apply_tile(
     try:
         result, info = render_surface(
             room_np, tile_np, alpha,
-            tile_w_mm=tile_width, tile_h_mm=tile_height, scale=scale,
+            tile_w_mm=tile_width, tile_h_mm=tile_height, scale=min(max(scale, 0.05), 10.0),
             is_glossy=is_glossy, surface_type=surface_type.lower(),
-            grout_mm=max(0.0, min(grout_mm, 20.0)),
+            grout_mm=max(0.0, min(grout_mm, 20.0)), pattern=pattern,
+            orientation_deg=float(orientation), grout_rgb=grout_rgb, mood=lighting,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -140,6 +179,25 @@ def apply_tile(
     output_path = f"outputs/{uuid.uuid4()}.jpg"
     cv2.imwrite(output_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 94])
     return FileResponse(output_path, media_type="image/jpeg", headers={"X-Render-Info": json.dumps(info)})
+
+
+# --- PRE-FLIGHT ANALYSIS: PHOTO QUALITY ADVISOR + COLOUR-HARMONY BEST MATCHES ---
+@router.post("/api/analyze-image")
+def analyze_image(room_image: UploadFile = File(...)):
+    """Runs when a room photo is opened, before any clicks.
+
+    quality: blur / exposure / camera-angle flags with the advice to show the user.
+    palette + best_matches: the room's dominant colours and the 3 most harmonious
+    catalog tiles (paths as in /api/catalog), for the "Best Match" badges."""
+    room_np, _ = read_rgb(room_image, MAX_IMAGE_SIDE)
+    result = {"width": int(room_np.shape[1]), "height": int(room_np.shape[0])}
+    result["quality"] = assess_quality(room_np)
+    try:
+        result.update(recommend(room_np, CATALOG_FOLDER))
+    except Exception as e:   # recommendations are a nicety; never fail the analysis over them
+        print(f"analyze-image: colour recommendations failed: {e}")
+        result.update(palette=[], best_matches=[])
+    return result
 
 
 # --- CATALOG LISTING (for the frontend tile picker) ---

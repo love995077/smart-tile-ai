@@ -46,6 +46,11 @@ SHADING_DETAIL_FLOOR = 0.12   # crisp light changes weaker than this (log units,
 SHADING_GRID_CELLS = 640      # resolution of the top-down metric grid used for lighting
 CONTACT_SHADOW = (0.25, 0.07) # floors: (darkening right at an object's base, decay distance in metres)
 BEVEL = (0.10, 1.5)           # tile edges: (darkening next to the grout, width in mm)
+PATTERNS = ("standard", "brick", "herringbone", "checkerboard")
+ORIENTATIONS = (0.0, 90.0, 45.0)
+MOODS = {"natural": None, "warm": (3000.0, 0.92), "cool": (6500.0, 1.0)}   # (kelvin, exposure)
+MOOD_REFERENCE_K = 4800.0     # a white-balanced interior photo, the baseline the moods shift from
+MOOD_STRENGTH = 0.45          # share of the full black-body shift applied
 
 
 @dataclass
@@ -538,36 +543,126 @@ def _line_coverage(a, half, footprint):
     return np.clip(cov * (1 - far) + 2 * half * far, 0, 1)
 
 
-def render_tile_layer(tile_img, a, b, tile_w_mm, tile_h_mm, grout_mm):
-    """RGB float32 tiles at tile-index coordinates (a, b): texture, analytic grout and edge bevel."""
+@dataclass
+class TileLayout:
+    """Where each pixel falls in its tile, for one laying pattern.
+
+    In the pattern's own frame every tile of every supported pattern is axis-aligned, so
+    a pixel is described by its position (lu, lv) in mm inside its tile, the tile's extent
+    (su, sv) along u and v, the quarter-turns `rot` its texture is laid at (0, 1 = 90 deg,
+    2 = 180 deg) and a tone multiplier `shade`. Grout and bevels then stay analytic.
+    """
+    lu: np.ndarray
+    lv: np.ndarray
+    su: object
+    sv: object
+    rot: object = 0
+    shade: object = 1.0
+
+
+def tile_layout(um, vm, tile_w, tile_h, pattern="standard"):
+    """Pattern-frame coordinates (mm) -> TileLayout. tile_w runs along u, tile_h along v.
+
+    standard     straight grid
+    brick        running bond: every other row shifted half a tile along u
+    checkerboard quarter-turn: alternate tiles rotated 90 deg (180 deg for oblong tiles),
+                 which a directional texture or sheen shows as a checker
+    herringbone  90 deg herringbone of L x W tiles (L = long side, laid along u). Closed
+                 form: horizontal tiles sit at i*(W, W) + j*(L, -L); along x - y the rows
+                 are 2L apart and each spans less than 2L, so row j is unique, then column i.
+                 A pixel outside its candidate horizontal tile is in the vertical one.
+    """
+    if pattern == "brick":
+        row = np.floor(vm / tile_h)
+        shift = 0.5 * tile_w * np.mod(row, 2)
+        return TileLayout(np.mod(um + shift, tile_w), np.mod(vm, tile_h), tile_w, tile_h)
+    if pattern == "checkerboard":
+        odd = np.mod(np.floor(um / tile_w) + np.floor(vm / tile_h), 2).astype(bool)
+        square = abs(tile_w - tile_h) <= 0.02 * max(tile_w, tile_h)
+        return TileLayout(np.mod(um, tile_w), np.mod(vm, tile_h), tile_w, tile_h,
+                          rot=np.where(odd, 1 if square else 2, 0), shade=np.where(odd, 0.965, 1.0))
+    if pattern == "herringbone":
+        L, W = max(tile_w, tile_h), min(tile_w, tile_h)
+        s = um - vm
+        j = np.floor((s + W) / (2 * L))
+        i = np.floor((vm + j * L) / W)
+        xh, yh = um - i * W - j * L, vm - i * W + j * L
+        in_h = (xh >= 0) & (xh < L) & (yh >= 0) & (yh < W)
+        jv = np.floor((s - L + W) / (2 * L))
+        iv = np.floor((um - L - jv * L) / W)
+        xv, yv = um - L - iv * W - jv * L, vm - (W - L) - iv * W + jv * L
+        return TileLayout(np.where(in_h, xh, xv), np.where(in_h, yh, yv),
+                          np.where(in_h, L, W), np.where(in_h, W, L), rot=np.where(in_h, 0, 1))
+    return TileLayout(np.mod(um, tile_w), np.mod(vm, tile_h), tile_w, tile_h)
+
+
+def render_tile_layer(tile_img, um, vm, tile_w_mm, tile_h_mm, grout_mm, pattern="standard", grout_rgb=None):
+    """RGB float32 tiles at pattern-frame coordinates (um, vm) in mm: texture, analytic grout and edge bevel.
+
+    grout_rgb: exact grout colour (sRGB 0-255), or None for a neutral grout tinted by the tile.
+    """
+    if pattern == "herringbone" and tile_h_mm > tile_w_mm:
+        # Herringbone lays the long side along u; turn the photo so its long side matches.
+        tile_img = np.ascontiguousarray(np.rot90(tile_img, -1))
+        tile_w_mm, tile_h_mm = tile_h_mm, tile_w_mm
     texture = build_tile_texture(tile_img, tile_w_mm, tile_h_mm)
     th, tw = texture.shape[:2]
-    rgb = sample_tiled(texture, a * tw, b * th)
+    lay = tile_layout(um, vm, tile_w_mm, tile_h_mm, pattern)
+
+    # Derivatives of the continuous pattern coordinates (mm per pixel). The per-tile
+    # coordinates jump at every joint, so their own gradients would be useless there.
+    dux, duy = np.gradient(um, axis=1), np.gradient(um, axis=0)
+    dvx, dvy = np.gradient(vm, axis=1), np.gradient(vm, axis=0)
+
+    a, b = lay.lu / lay.su, lay.lv / lay.sv
+    rot = lay.rot
+    if np.ndim(rot) == 0 and rot == 0:
+        s, t = a * tw, b * th
+        derivs = (dux / lay.su * tw, dvx / lay.sv * th, duy / lay.su * tw, dvy / lay.sv * th)
+    else:
+        # Texture laid at a quarter-turn (rot 1: s along v, t against u) or a half-turn.
+        r1, r2 = rot == 1, rot == 2
+
+        def pick(quarter, half, straight):
+            return np.where(r1, quarter, np.where(r2, half, straight))
+
+        s = pick(b, 1 - a, a) * tw
+        t = pick(1 - a, 1 - b, b) * th
+        ga_x, ga_y = dux / lay.su, duy / lay.su
+        gb_x, gb_y = dvx / lay.sv, dvy / lay.sv
+        derivs = (pick(gb_x, -ga_x, ga_x) * tw, pick(-ga_x, -gb_x, gb_x) * th,
+                  pick(gb_y, -ga_y, ga_y) * tw, pick(-ga_y, -gb_y, gb_y) * th)
+    rgb = sample_tiled(texture, s, t, derivs=derivs)
+    if np.ndim(lay.shade) or lay.shade != 1.0:
+        rgb *= np.asarray(lay.shade, np.float32)[..., None]
 
     # Pixel footprint along each tile axis (box extent of the pixel in tile units).
-    fa = np.abs(np.gradient(a, axis=1)) + np.abs(np.gradient(a, axis=0))
-    fb = np.abs(np.gradient(b, axis=1)) + np.abs(np.gradient(b, axis=0))
-    ha, hb = 0.5 * grout_mm / tile_w_mm, 0.5 * grout_mm / tile_h_mm
+    fa = (np.abs(dux) + np.abs(duy)) / lay.su
+    fb = (np.abs(dvx) + np.abs(dvy)) / lay.sv
+    ha, hb = 0.5 * grout_mm / lay.su, 0.5 * grout_mm / lay.sv
 
     # Edge bevel: tiles darken slightly towards the grout; invisible once sub-pixel.
     strength, width_mm = BEVEL
-    ea = np.maximum((np.abs(a - np.round(a)) - ha) * tile_w_mm, 0)
-    eb = np.maximum((np.abs(b - np.round(b)) - hb) * tile_h_mm, 0)
-    va = np.clip(width_mm / np.maximum(fa * tile_w_mm, 1e-6), 0, 1)
-    vb = np.clip(width_mm / np.maximum(fb * tile_h_mm, 1e-6), 0, 1)
+    ea = np.maximum((np.abs(a - np.round(a)) - ha) * lay.su, 0)
+    eb = np.maximum((np.abs(b - np.round(b)) - hb) * lay.sv, 0)
+    va = np.clip(width_mm / np.maximum(fa * lay.su, 1e-6), 0, 1)
+    vb = np.clip(width_mm / np.maximum(fb * lay.sv, 1e-6), 0, 1)
     dark = np.maximum(np.exp(-ea / width_mm) * va, np.exp(-eb / width_mm) * vb)
     rgb *= (1.0 - strength * dark)[..., None].astype(np.float32)
 
     if grout_mm <= 0:
         return rgb
     cov = 1.0 - (1.0 - _line_coverage(a, ha, fa)) * (1.0 - _line_coverage(b, hb, fb))
-    # Grout picks up the tile's tint and sits recessed, so slightly darker.
-    grout = (0.35 * texture.reshape(-1, 3).mean(0) + 0.65 * np.array([190.0, 186.0, 180.0])) * 0.72
+    if grout_rgb is None:
+        # Grout picks up the tile's tint and sits recessed, so slightly darker.
+        grout = (0.35 * texture.reshape(-1, 3).mean(0) + 0.65 * np.array([190.0, 186.0, 180.0])) * 0.72
+    else:
+        grout = np.asarray(grout_rgb, np.float64)
     cov = cov[..., None].astype(np.float32)
     return rgb * (1 - cov) + grout.astype(np.float32) * cov
 
 
-def sample_tiled(texture, s, t, lod_bias=-0.25, max_taps=8):
+def sample_tiled(texture, s, t, lod_bias=-0.25, max_taps=8, derivs=None):
     """Samples an infinitely repeated texture at texel coords (s, t) with anisotropic filtering.
 
     A floor seen at an angle is squashed far more along one screen direction than the
@@ -577,10 +672,16 @@ def sample_tiled(texture, s, t, lod_bias=-0.25, max_taps=8):
     pixel footprint, and up to `max_taps` samples are averaged along the long axis, the
     way GPUs do anisotropic filtering. Distant tiles still average out instead of
     shimmering.
+
+    derivs: (ds/dx, dt/dx, ds/dy, dt/dy) when s, t are per-tile coordinates that jump at
+    joints (bricks, herringbone); otherwise they come from np.gradient.
     """
     th, tw = texture.shape[:2]
-    dsx, dtx = np.gradient(s, axis=1), np.gradient(t, axis=1)
-    dsy, dty = np.gradient(s, axis=0), np.gradient(t, axis=0)
+    if derivs is None:
+        dsx, dtx = np.gradient(s, axis=1), np.gradient(t, axis=1)
+        dsy, dty = np.gradient(s, axis=0), np.gradient(t, axis=0)
+    else:
+        dsx, dtx, dsy, dty = derivs
     lx, ly = np.hypot(dsx, dtx), np.hypot(dsy, dty)
     x_major = lx >= ly
     major = np.maximum(np.where(x_major, lx, ly), 1e-6)
@@ -865,9 +966,67 @@ def floor_reflection(room_np, alpha):
 
 # --------------------------------------------------------------------------- main entry
 
+def kelvin_to_linear_rgb(kelvin):
+    """Linear-sRGB colour (luminance 1) of a black-body light, via the Planckian locus in CIE xy.
+
+    Kim et al.'s cubic fit of the locus (1667-25000 K), then xyY -> XYZ -> linear sRGB.
+    """
+    T = float(np.clip(kelvin, 1667.0, 25000.0))
+    if T <= 4000:
+        x = -0.2661239e9 / T ** 3 - 0.2343589e6 / T ** 2 + 0.8776956e3 / T + 0.179910
+    else:
+        x = -3.0258469e9 / T ** 3 + 2.1070379e6 / T ** 2 + 0.2226347e3 / T + 0.240390
+    if T <= 2222:
+        y = -1.1063814 * x ** 3 - 1.34811020 * x ** 2 + 2.18555832 * x - 0.20219683
+    elif T <= 4000:
+        y = -0.9549476 * x ** 3 - 1.37418593 * x ** 2 + 2.09137015 * x - 0.16748867
+    else:
+        y = 3.0817580 * x ** 3 - 5.87338670 * x ** 2 + 3.75112997 * x - 0.37001483
+    xyz = np.array([x / y, 1.0, (1.0 - x - y) / y])
+    m = np.array([[3.2406, -1.5372, -0.4986], [-0.9689, 1.8758, 0.0415], [0.0557, -0.2040, 1.0570]])
+    return np.maximum(m @ xyz, 1e-4)
+
+
+def mood_gains(mood):
+    """Per-channel light gains (linear RGB) for a lighting mood, or None for the photo's own light.
+
+    The mood's colour temperature is taken relative to MOOD_REFERENCE_K, a typical
+    white-balanced interior, at MOOD_STRENGTH (a full black-body shift reads as a colour
+    filter, not as different light). Gains keep luminance, so only the light's colour changes.
+    """
+    if mood not in MOODS or MOODS[mood] is None:
+        return None
+    kelvin, exposure = MOODS[mood]
+    g = kelvin_to_linear_rgb(kelvin) / kelvin_to_linear_rgb(MOOD_REFERENCE_K)
+    g = 1.0 + MOOD_STRENGTH * (g - 1.0)
+    g /= 0.2126 * g[0] + 0.7152 * g[1] + 0.0722 * g[2]
+    return (g * exposure).astype(np.float32)
+
+
+def apply_mood(image, mood):
+    """Relights a whole RGB image (uint8 or float 0-255) for a lighting mood.
+
+    The mood changes the light falling on the scene, which multiplies every surface's
+    reflected colour by the illuminant (von Kries, in linear light): the new tiles' lighting
+    layer and the rest of the photo shift together, so the render stays coherent.
+    """
+    gains = mood_gains(mood)
+    if gains is None:
+        return image
+    lin = srgb_to_linear(np.asarray(image, np.float32)) * gains
+    return linear_to_srgb(tone_map(lin, knee=0.9)).astype(np.float32)
+
+
 def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, scale=1.0,
-                   is_glossy=False, surface_type="auto", grout_mm=2.0):
-    """Replaces the surface under `alpha` with the tile. Returns (RGB uint8 image, info dict)."""
+                   is_glossy=False, surface_type="auto", grout_mm=2.0, pattern="standard",
+                   orientation_deg=0.0, grout_rgb=None, mood="natural"):
+    """Replaces the surface under `alpha` with the tile. Returns (RGB uint8 image, info dict).
+
+    pattern: one of PATTERNS. orientation_deg: the layout's turn on the surface (0, 90 or
+    45 for a diamond lay). grout_rgb: exact grout colour or None. mood: one of MOODS.
+    """
+    if pattern not in PATTERNS:
+        raise ValueError(f"Unknown pattern '{pattern}'.")
     h, w = alpha.shape
     mask_bin = (alpha > 0.5).astype(np.uint8)
     if mask_bin.sum() < 0.002 * h * w:
@@ -890,14 +1049,17 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
     anchor = np.argmax(my) if geo.surface == "floor" else len(my) // 2
     u0, v0 = u[my[anchor], mx[anchor]], v[my[anchor], mx[anchor]]
 
-    # Tile-index coordinates: integers are tile edges. Grout scales with the tile so the
-    # size slider keeps proportions.
+    # Pattern-frame coordinates in mm, turned by the chosen orientation around the anchor,
+    # which sits mid-tile along u. Grout scales with the tile so the size slider keeps proportions.
     scale = max(0.05, float(scale))
     tile_w, tile_h = tile_w_mm * scale, tile_h_mm * scale
-    a = (u - u0) * 1000.0 / tile_w + 0.5
-    b = (v - v0) * 1000.0 / tile_h
+    du, dv = (u - u0) * 1000.0, (v - v0) * 1000.0
+    if orientation_deg:
+        c, s = np.cos(np.radians(orientation_deg)), np.sin(np.radians(orientation_deg))
+        du, dv = c * du + s * dv, -s * du + c * dv
+    um, vm = du + 0.5 * tile_w, dv
     tile_img = fit_tile_aspect(prepare_tile_image(tile_np), tile_w_mm, tile_h_mm)
-    tiles = render_tile_layer(tile_img, a, b, tile_w, tile_h, grout_mm * scale)
+    tiles = render_tile_layer(tile_img, um, vm, tile_w, tile_h, grout_mm * scale, pattern=pattern, grout_rgb=grout_rgb)
     tiles = cv2.GaussianBlur(tiles, (0, 0), 0.35)   # a touch of camera optics; filtering handles aliasing
     base = srgb_to_linear(tiles) * scene_exposure(room_np)
     if is_glossy:
@@ -923,7 +1085,9 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
 
     result = room_np.astype(np.float32)
     result[y0:y1, x0:x1] = composite(result[y0:y1, x0:x1], out, alpha[y0:y1, x0:x1])
-    return np.clip(result, 0, 255).astype(np.uint8), geo.info
+    result = apply_mood(result, mood)
+    info = {**geo.info, "pattern": pattern, "orientation_deg": orientation_deg, "mood": mood}
+    return np.clip(result, 0, 255).astype(np.uint8), info
 
 
 def composite(room, new, alpha):

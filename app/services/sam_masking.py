@@ -7,6 +7,10 @@ from app.services.segmentation import predict_logits
 
 OVERLAY_COLOR = np.array([45, 212, 191], dtype=np.float32)   # teal-400: selected surface
 EXCLUDED_COLOR = np.array([244, 63, 94], dtype=np.float32)   # rose-500: auto-excluded objects
+# Median photo gradient a straightened edge needs along its length. Faint real junctions
+# (white wall meeting white ceiling, raw concrete) score 0.04-0.08; lines drawn across
+# SAM speckle or along an irregular outline score under 0.01.
+STRAIGHT_MIN_SUPPORT = 0.02
 
 
 def _guided_filter(guide, src, radius, eps):
@@ -253,7 +257,226 @@ def _close_halo(image_np, binary, alpha, reach):
     return out
 
 
-def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=True):
+def _rdp_indices(pts, eps):
+    """Ramer-Douglas-Peucker on an open polyline; returns the kept vertex indices (sorted)."""
+    keep = {0, len(pts) - 1}
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        i0, i1 = stack.pop()
+        if i1 - i0 < 2:
+            continue
+        a, b = pts[i0], pts[i1]
+        ab = b - a
+        norm = np.hypot(ab[0], ab[1])
+        seg = pts[i0 + 1:i1] - a
+        if norm < 1e-9:
+            dist = np.hypot(seg[:, 0], seg[:, 1])
+        else:
+            dist = np.abs(seg[:, 0] * ab[1] - seg[:, 1] * ab[0]) / norm
+        k = int(np.argmax(dist))
+        if dist[k] > eps:
+            mid = i0 + 1 + k
+            keep.add(mid)
+            stack += [(i0, mid), (mid, i1)]
+    return sorted(keep)
+
+
+def _fit_line(pts):
+    """Total-least-squares line through pts: (centre, unit direction, unit normal)."""
+    c = pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+    d = vt[0] / np.linalg.norm(vt[0])
+    return c, d, np.array([-d[1], d[0]])
+
+
+def _is_wiggle_not_curve(t, s, tol):
+    """True when the offsets s(t) from a fitted line are noise around it, not a curve.
+
+    SAM's ragged edge along a floor-wall junction scatters around the true line, so a
+    quadratic explains it barely better than the line. A round rug, curved sofa or
+    bowed shadow bends consistently, so the quadratic removes most of the residual.
+    """
+    if np.abs(s).max() > tol:
+        return False
+    rms_line = float(np.sqrt(np.mean(s * s)))
+    if rms_line < 1.0:
+        return True                       # already straight to within a pixel
+    tn = (t - t.mean()) / max(np.ptp(t), 1e-6)
+    coef = np.polyfit(tn, s, 2)
+    rms_quad = float(np.sqrt(np.mean((np.polyval(coef, tn) - s) ** 2)))
+    return rms_quad > 0.6 * rms_line
+
+
+def _edge_support(grad, centre, d, n, half_len):
+    """Median photo gradient across a line segment (0 = no edge along it).
+
+    The MEDIAN over samples along the whole segment, so only an edge that runs along most
+    of it scores, not a few crossing object edges or a curvy outline the line cuts through.
+    """
+    gx, gy = grad
+    h, w = gx.shape
+    ts = np.linspace(-half_len, half_len, max(8, int(half_len)))
+    px = centre[0] + ts * d[0]
+    py = centre[1] + ts * d[1]
+    ok = (px >= 0) & (px <= w - 1) & (py >= 0) & (py <= h - 1)
+    if ok.sum() < 0.7 * len(ts):
+        return -1.0
+    xi, yi = np.round(px[ok]).astype(int), np.round(py[ok]).astype(int)
+    return float(np.median(np.abs(gx[yi, xi] * n[0] + gy[yi, xi] * n[1])))
+
+
+def _snap_line_to_edge(grad, centre, d, n, half_len, search):
+    """Shifts / tilts a fitted line onto the strongest straight photo edge nearby.
+
+    Candidates are offsets up to `search` px and tilts up to 1.5 deg, scored by
+    _edge_support. Returns (centre, d, n, support), unchanged when there is no clearer edge.
+    """
+    base = _edge_support(grad, centre, d, n, half_len)
+    best = (base, centre, d, n)
+    for ang in np.radians([-1.5, -0.75, 0.0, 0.75, 1.5]):
+        ca, sa = np.cos(ang), np.sin(ang)
+        d2 = np.array([ca * d[0] - sa * d[1], sa * d[0] + ca * d[1]])
+        n2 = np.array([-d2[1], d2[0]])
+        for off in range(-search, search + 1):
+            c2 = centre + off * n2
+            # A small preference for the original fit, so equal edges don't drift it.
+            sc = _edge_support(grad, c2, d2, n2, half_len) * (1.0 - 0.01 * abs(off))
+            if sc > best[0]:
+                best = (sc, c2, d2, n2)
+    if best[0] > max(1.25 * base, 0.04):
+        return best[1], best[2], best[3], best[0]
+    return centre, d, n, base
+
+
+def straighten_boundaries(image_np, binary, protect=None, negative_clicks=(), diagnostics=None):
+    """Architectural contour regularisation: straight floor-wall / wall-ceiling junctions.
+
+    MobileSAM traces low-contrast junctions (raw concrete meeting raw concrete, plaster
+    against plaster) as a ragged, wavy line. Here the outer boundary is split into runs
+    that are free to change: away from the photo border (already straight), from detected
+    foreground objects (`protect`, whose cutouts must stay tight) and from the user's
+    exclude clicks. Each run is simplified with Ramer-Douglas-Peucker; every long
+    polygon edge whose original contour is a wiggle around a line (not a curve, see
+    _is_wiggle_not_curve) is replaced by a total-least-squares line, snapped onto the
+    photo's real edge when one runs along it. Adjacent straight edges meet at their exact
+    intersection, so corners stay sharp.
+
+    Returns (binary uint8, band uint8 marking pixels on straightened edges, edge count).
+    """
+    h, w = binary.shape
+    L = max(h, w)
+    min_seg = 0.08 * L
+    tol = max(3.0, 0.008 * L)
+    band = np.zeros((h, w), np.uint8)
+    if binary.sum() < 0.002 * h * w:
+        return binary, band, 0
+
+    blocked = np.zeros((h, w), bool)
+    blocked[:3, :] = blocked[-3:, :] = True
+    blocked[:, :3] = blocked[:, -3:] = True
+    if protect is not None and protect.any():
+        k = int(round(tol)) * 2 + 1
+        blocked |= cv2.dilate(protect.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+
+    gray = cv2.GaussianBlur(cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0, (0, 0), 1.5)
+    grad = (cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    negs = np.array(negative_clicks, dtype=np.float64).reshape(-1, 2)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    orig_fill = np.zeros((h, w), np.uint8)
+    new_fill = np.zeros((h, w), np.uint8)
+    count = 0
+    for cnt in contours:
+        pts = cnt[:, 0, :].astype(np.float64)
+        n_pts = len(pts)
+        cv2.drawContours(orig_fill, [cnt], -1, 1, thickness=cv2.FILLED)
+        if n_pts < min_seg or cv2.contourArea(cnt) < 0.002 * h * w:
+            cv2.drawContours(new_fill, [cnt], -1, 1, thickness=cv2.FILLED)
+            continue
+        free = ~blocked[pts[:, 1].astype(int), pts[:, 0].astype(int)]
+        # Rotate so index 0 is a blocked point (runs then never wrap), if there is one.
+        start = int(np.argmin(free)) if not free.all() else 0
+        order = np.roll(np.arange(n_pts), -start)
+        pts_r, free_r = pts[order], free[order]
+
+        # Runs of consecutive free points.
+        runs, i = [], 0
+        while i < n_pts:
+            if not free_r[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n_pts and free_r[j + 1]:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+
+        lines = []   # (i0, i1, centre, d, n) in rotated-contour indices
+        for r0, r1 in runs:
+            if r1 - r0 + 1 < min_seg:
+                continue
+            run = pts_r[r0:r1 + 1]
+            verts = _rdp_indices(run, 0.9 * tol)
+            for a, b in zip(verts[:-1], verts[1:]):
+                seg = run[a:b + 1]
+                chord = np.hypot(*(seg[-1] - seg[0]))
+                if chord < min_seg or len(seg) < 10:
+                    continue
+                c, d, nrm = _fit_line(seg)
+                rel = seg - c
+                t, s = rel @ d, rel @ nrm
+                if not _is_wiggle_not_curve(t, s, tol):
+                    continue
+                half = 0.5 * (t.max() - t.min())
+                c = c + 0.5 * (t.max() + t.min()) * d
+                c, d, nrm, support = _snap_line_to_edge(grad, c, d, nrm, half, int(round(tol)))
+                if diagnostics is not None:
+                    diagnostics.append({"p0": (c - half * d).round(1).tolist(), "p1": (c + half * d).round(1).tolist(),
+                                        "support": round(support, 4), "wiggle_rms": round(float(s.std()), 2)})
+                if support < STRAIGHT_MIN_SUPPORT:
+                    continue
+                # Skip when an exclude click sits in the strip this edge would rewrite.
+                if len(negs):
+                    rn = negs - c
+                    if np.any((np.abs(rn @ d) <= half + tol) & (np.abs(rn @ nrm) <= tol + 3)):
+                        continue
+                lines.append((r0 + a, r0 + b, c, d, nrm))
+
+        new_pts = pts_r.copy()
+        for k, (i0, i1, c, d, nrm) in enumerate(lines):
+            seg = pts_r[i0:i1 + 1]
+            new_pts[i0:i1 + 1] = c + np.outer((seg - c) @ d, d)
+            half = 0.5 * np.ptp((seg - c) @ d)
+            corners = np.array([c - (half + tol) * d - (tol + 3) * nrm, c + (half + tol) * d - (tol + 3) * nrm,
+                                c + (half + tol) * d + (tol + 3) * nrm, c - (half + tol) * d + (tol + 3) * nrm])
+            cv2.fillConvexPoly(band, np.round(corners).astype(np.int32), 1)
+            count += 1
+        # Sharp corners: adjacent straightened edges meet at their intersection.
+        for (i0, i1, c1, d1, _), (j0, j1, c2, d2, _) in zip(lines[:-1], lines[1:]):
+            if i1 != j0:
+                continue
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(cross) < np.sin(np.radians(8)):
+                continue
+            t1 = ((c2 - c1)[0] * d2[1] - (c2 - c1)[1] * d2[0]) / cross
+            p = c1 + t1 * d1
+            if np.hypot(*(p - pts_r[i1])) < 3 * tol:
+                new_pts[i1] = p
+        cv2.fillPoly(new_fill, [np.round(new_pts).astype(np.int32)], 1)
+
+    if not count:
+        return binary, band, 0
+    holes = (orig_fill > 0) & (binary == 0)
+    out = binary.copy()
+    sel = (band > 0) & ~holes
+    if protect is not None:
+        sel &= protect == 0          # object pixels keep whatever the mask said
+    out[sel] = new_fill[sel]
+    band[~sel] = 0
+    return out, band, count
+
+
+def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=True, straighten=True):
     """Returns (alpha, info): a float32 alpha matte in [0, 1] for the clicked surface.
 
     With auto_exclude, detected foreground objects (people, chairs, laptops, ...) are
@@ -290,6 +513,19 @@ def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=T
             break
     binary = grown
 
+    straight = np.zeros(binary.shape, np.uint8)
+    info["straightened_edges"] = 0
+    if straighten:
+        # Every detected object keeps its outline, including ones SAM already left out of
+        # the surface (they never reach info["excluded"]): chair legs, pillows, plants.
+        protect = info["excluded"].copy()
+        if auto_exclude:
+            for o in foreground_objects(image_np):
+                x0, y0, x1, y1 = o.region
+                protect[y0:y1, x0:x1] |= o.mask.astype(np.uint8)
+        binary, straight, info["straightened_edges"] = straighten_boundaries(
+            image_np, binary, protect=protect, negative_clicks=negative_clicks)
+
     h, w = binary.shape
     radius = max(3, int(round(max(h, w) * 0.005)))
     guide = image_np.astype(np.float32) / 255.0
@@ -309,6 +545,9 @@ def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=T
     grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
     edge_strength = cv2.dilate(cv2.GaussianBlur(grad, (0, 0), 1.0), kernel)
     follow = np.clip((edge_strength - 0.15) / 0.45, 0.0, 1.0)
+    # Straightened junctions stay a clean anti-aliased line: following a rough concrete
+    # edge with the guided filter would bring the wiggle back.
+    follow[straight > 0] = 0.0
     # Smooth SAM's slightly wavy outline (~2px) before the 1-2px anti-aliasing.
     smooth_outline = (cv2.GaussianBlur(binary.astype(np.float32), (0, 0), 2.0) > 0.5).astype(np.float32)
     crisp = cv2.GaussianBlur(smooth_outline, (0, 0), 0.8)
@@ -319,7 +558,8 @@ def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=T
     # base) or punch translucent holes into the floor.
     bound = cv2.GaussianBlur(binary.astype(np.float32), (0, 0), 1.5)
     alpha = np.where(binary > 0, np.maximum(alpha, bound), np.minimum(alpha, bound))
-    alpha = _close_halo(image_np, binary, alpha, reach=max(6, int(round(max(h, w) * 0.009))))
+    haloed = _close_halo(image_np, binary, alpha, reach=max(6, int(round(max(h, w) * 0.009))))
+    alpha = np.where(straight > 0, alpha, haloed)
     return cv2.GaussianBlur(alpha, (3, 3), 0).astype(np.float32), info
 
 

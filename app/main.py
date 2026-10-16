@@ -1,4 +1,6 @@
 import os
+import threading
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,11 +8,21 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
+from app.services.color_harmony import warm_catalog
+from app.services.visual_search import CATALOG_FOLDER
 
 for folder in ("catalog_tiles", "outputs", "static"):
     os.makedirs(folder, exist_ok=True)
 
-app = FastAPI(title="Smart Tile AI API")
+@asynccontextmanager
+async def lifespan(_app):
+    # Colour profiles for the "Best Match" badges: cheap (no model), but reading every
+    # catalog image on the first upload would delay its analysis.
+    threading.Thread(target=warm_catalog, args=(CATALOG_FOLDER,), daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Smart Tile AI API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

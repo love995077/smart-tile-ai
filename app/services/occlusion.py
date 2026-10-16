@@ -20,6 +20,8 @@ MAX_OBJECTS = 48
 MAX_SURFACE_SHARE = 0.5      # one object mask covering more of the surface than this is a mis-segmentation
 EDGE_DILATE_PX = 2           # also take the 1-2px fringe SAM leaves around objects
 MIN_CLASS_SAMPLES = 40       # colour samples needed to model the object / the surrounding surface
+MARKING_MAX_TEXTURE = 6.0    # L std (0-255 LAB) below which a detection inside the surface is a flat stain...
+MARKING_MAX_DELTA_E = 20.0   # ...if it is also this close in colour to the surface around it
 
 # The detector uses VOC-style names for some COCO classes.
 PRETTY = {"tvmonitor": "monitor", "sofa": "sofa", "diningtable": "table", "pottedplant": "plant",
@@ -145,6 +147,35 @@ def _object_pixels(lab, obj_mask, surface, x0, y0, x1, y1):
     return keep
 
 
+def _is_surface_marking(lab, obj_mask, surface, x0, y0, x1, y1):
+    """True for a stain, damp patch or paint mark that the detector mistook for an object.
+
+    On raw concrete the detector reports flat blotches as "bird" or "donut" with scores up
+    to 0.6, and cutting them out leaves holes of old floor in the render. A marking lies
+    inside the surface SAM selected, has no texture of its own and is close in colour to
+    the surface around it. Real objects (even plain grey office chairs) have internal
+    shading or clear contrast, and SAM rarely swallows them whole.
+    """
+    h, w = surface.shape
+    m = obj_mask.astype(bool)
+    if m.sum() < 30 or (surface[y0:y1, x0:x1][m] > 0).mean() < 0.9:
+        return False
+    inner = cv2.erode(m.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    if inner.sum() < 20:
+        inner = m
+    pad = max(8, int(0.15 * max(x1 - x0, y1 - y0)))
+    X0, Y0, X1, Y1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+    full = np.zeros((Y1 - Y0, X1 - X0), np.uint8)
+    full[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0] = m
+    ring = (cv2.dilate(full, np.ones((2 * pad + 1, 2 * pad + 1), np.uint8)) > 0) & (full == 0)
+    ring &= surface[Y0:Y1, X0:X1] > 0
+    if ring.sum() < MIN_CLASS_SAMPLES:
+        return False
+    inside = lab[y0:y1, x0:x1][inner]
+    delta_e = float(np.linalg.norm(inside.mean(0) - lab[Y0:Y1, X0:X1][ring].mean(0)))
+    return float(inside[:, 0].std()) < MARKING_MAX_TEXTURE and delta_e < MARKING_MAX_DELTA_E
+
+
 def subtract_foreground(surface, objects, positive_clicks, image_np=None):
     """Removes detected objects from a binary surface mask.
 
@@ -170,6 +201,8 @@ def subtract_foreground(surface, objects, positive_clicks, image_np=None):
         if any(x0 <= x < x1 and y0 <= y < y1 and m[int(y) - y0, int(x) - x0] for x, y in positive_clicks):
             continue
         if lab is not None:
+            if _is_surface_marking(lab, m, out, x0, y0, x1, y1):
+                continue
             m = _object_pixels(lab, m, out, x0, y0, x1, y1)
             if not m.any():
                 continue

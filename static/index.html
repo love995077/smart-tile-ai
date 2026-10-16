@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#16191c">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316191c'/%3E%3Crect x='7' y='7' width='8' height='8' rx='1.5' fill='%232dd4bf'/%3E%3Crect x='17' y='7' width='8' height='8' rx='1.5' fill='%23fff'/%3E%3Crect x='7' y='17' width='8' height='8' rx='1.5' fill='%23fff'/%3E%3Crect x='17' y='17' width='8' height='8' rx='1.5' fill='%232dd4bf'/%3E%3C/svg%3E">
   <title>Smart Tile AI — Visualizer</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -25,12 +27,15 @@
     };
   </script>
   <style>
-    html, body { height: 100%; }
-    body { -webkit-font-smoothing: antialiased; }
+    html, body { min-height: 100%; }
+    @media (min-width: 1024px) { html, body { height: 100%; } }
+    body { -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
     .grain { background-image: radial-gradient(rgba(0,0,0,.035) 1px, transparent 1px); background-size: 3px 3px; }
     .dropzone.drag { border-color: #14b8a6; background: rgba(20,184,166,.06); }
     .seg button[aria-pressed="true"] { background: #fff; color: #16191c; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+    .mode button[aria-pressed="true"] { background: rgba(255,255,255,.16); color: #fff; }
     .tile-card[aria-selected="true"] { outline: 2px solid #14b8a6; outline-offset: 2px; }
+    .swatch[aria-pressed="true"] { box-shadow: 0 0 0 2px #fff, 0 0 0 4px #14b8a6; }
     input[type=range] { accent-color: #14b8a6; }
     .shimmer { background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,.55) 50%, rgba(255,255,255,0) 100%); background-size: 200% 100%; animation: shimmer 1.6s linear infinite; }
     @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
@@ -38,14 +43,21 @@
     @keyframes spin { to { transform: rotate(360deg); } }
     .scroll-thin::-webkit-scrollbar { width: 8px; }
     .scroll-thin::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 8px; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
     canvas { touch-action: none; }
+    .best-pill { background: linear-gradient(135deg, #fde68a, #f59e0b); color: #451a03; }
+    .cam-grid { background-image:
+      linear-gradient(to right, transparent calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% + .5px), transparent calc(33.333% + .5px), transparent calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% + .5px), transparent calc(66.666% + .5px)),
+      linear-gradient(to bottom, transparent calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% + .5px), transparent calc(33.333% + .5px), transparent calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% + .5px), transparent calc(66.666% + .5px)); }
+    .level-line { transition: transform .08s linear, background-color .2s; }
+    @media (prefers-reduced-motion: reduce) { .orbit, .shimmer { animation: none; } .level-line { transition: none; } }
   </style>
 </head>
 <body class="bg-stone-50 text-ink-900 font-sans">
 
 <!-- ======================= SCREEN 1: LANDING ======================= -->
 <main id="screen-landing" class="min-h-full grid lg:grid-cols-2">
-  <section class="relative flex flex-col justify-between px-6 sm:px-12 xl:px-20 py-10 bg-white">
+  <section class="relative flex flex-col justify-between px-5 sm:px-12 xl:px-20 py-8 sm:py-10 bg-white">
     <header class="flex items-center gap-2.5">
       <div class="h-8 w-8 rounded-lg bg-ink-900 grid place-items-center">
         <div class="grid grid-cols-2 gap-0.5"><span class="h-2 w-2 bg-accent-400 rounded-[2px]"></span><span class="h-2 w-2 bg-white rounded-[2px]"></span><span class="h-2 w-2 bg-white rounded-[2px]"></span><span class="h-2 w-2 bg-accent-400 rounded-[2px]"></span></div>
@@ -53,88 +65,129 @@
       <span class="font-semibold tracking-tight">Smart Tile AI</span>
     </header>
 
-    <div class="max-w-xl py-12">
+    <div class="max-w-xl py-8 sm:py-12">
       <p class="text-xs font-semibold uppercase tracking-[.18em] text-accent-700">Room visualizer</p>
-      <h1 class="font-display text-5xl sm:text-6xl leading-[1.02] mt-4">See the floor<br><em class="text-stone-500">before you lay it.</em></h1>
-      <p class="mt-5 text-stone-600 text-lg leading-relaxed">Upload a photo of your room, click the surface you want to change, and preview any tile with true-to-scale sizing, real shadows and reflections.</p>
+      <h1 class="font-display text-[2.6rem] sm:text-6xl leading-[1.02] mt-4">See the floor<br><em class="text-stone-500">before you lay it.</em></h1>
+      <p class="mt-5 text-stone-600 text-base sm:text-lg leading-relaxed">Upload a photo of your room, click the surface you want to change, and preview any tile with true-to-scale sizing, real shadows and reflections.</p>
 
-      <label id="dropzone" class="dropzone mt-9 flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed border-stone-300 px-6 py-12 text-center cursor-pointer transition-colors hover:border-accent-500 hover:bg-stone-50">
+      <label id="dropzone" class="dropzone mt-8 sm:mt-9 flex flex-col items-center justify-center gap-4 rounded-2xl border-2 border-dashed border-stone-300 px-5 py-9 sm:py-12 text-center cursor-pointer transition-colors hover:border-accent-500 hover:bg-stone-50">
         <input id="room-input" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only">
         <div class="h-12 w-12 rounded-full bg-stone-100 grid place-items-center">
-          <svg class="h-6 w-6 text-stone-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.6"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0l-4 4m4-4l4 4M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+          <svg class="h-6 w-6 text-stone-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0l-4 4m4-4l4 4M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
         </div>
         <div>
-          <p class="font-medium">Drop a room photo here</p>
-          <p class="text-sm text-stone-500 mt-1">or <span class="text-accent-700 font-medium underline underline-offset-2">browse your files</span> · JPG, PNG, WebP</p>
+          <p class="font-medium"><span class="hidden sm:inline">Drop a room photo here</span><span class="sm:hidden">Add a room photo</span></p>
+          <p class="text-sm text-stone-500 mt-1">JPG, PNG or WebP</p>
+        </div>
+        <div class="flex flex-wrap items-center justify-center gap-2.5">
+          <span class="inline-flex items-center gap-2 rounded-xl bg-ink-900 text-white text-sm font-medium px-4 py-2.5 min-h-[44px]">
+            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>
+            Browse Files
+          </span>
+          <button id="btn-camera" type="button" class="inline-flex items-center gap-2 rounded-xl border border-stone-300 bg-white text-sm font-medium px-4 py-2.5 min-h-[44px] hover:border-accent-500 hover:text-accent-700">
+            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 9a2 2 0 012-2h1.5l1.4-2h8.2l1.4 2H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><circle cx="12" cy="13" r="3.5"/></svg>
+            Take Photo
+          </button>
         </div>
       </label>
-      <p class="mt-4 text-xs text-stone-500">Tip: shoot at chest height with the floor clearly visible. Everything runs on this machine; photos never leave it.</p>
+      <input type="file" accept="image/*" capture="environment" id="camera-input" class="sr-only" tabindex="-1" aria-hidden="true">
+      <p class="mt-4 text-xs text-stone-500">Tip: shoot at chest height with the floor clearly visible. The camera guide shows when your phone is level.</p>
     </div>
 
-    <ol class="grid grid-cols-3 gap-4 text-sm max-w-xl">
-      <li><span class="font-display text-2xl text-accent-600">01</span><p class="text-stone-600 mt-1">Click to select a floor or wall</p></li>
-      <li><span class="font-display text-2xl text-accent-600">02</span><p class="text-stone-600 mt-1">Pick a tile and its real size</p></li>
-      <li><span class="font-display text-2xl text-accent-600">03</span><p class="text-stone-600 mt-1">Render a photoreal preview</p></li>
+    <ol class="grid grid-cols-3 gap-3 sm:gap-4 text-sm max-w-xl">
+      <li><span class="font-display text-2xl text-accent-600">01</span><p class="text-stone-600 mt-1">Tap to select a floor or wall</p></li>
+      <li><span class="font-display text-2xl text-accent-600">02</span><p class="text-stone-600 mt-1">Pick a tile, size &amp; pattern</p></li>
+      <li><span class="font-display text-2xl text-accent-600">03</span><p class="text-stone-600 mt-1">Render &amp; share the spec sheet</p></li>
     </ol>
   </section>
 
-  <section class="bg-stone-100 grain px-6 sm:px-12 xl:px-16 py-10 flex flex-col">
-    <div class="flex items-end justify-between">
-      <div>
-        <h2 class="font-display text-3xl">Or start with a demo room</h2>
-        <p class="text-sm text-stone-500 mt-1">Pre-loaded spaces to try the visualizer instantly.</p>
-      </div>
+  <section class="bg-stone-100 grain px-5 sm:px-12 xl:px-16 py-8 sm:py-10 flex flex-col">
+    <div>
+      <h2 class="font-display text-3xl">Or start with a demo room</h2>
+      <p class="text-sm text-stone-500 mt-1">Pre-loaded spaces to try the visualizer instantly.</p>
     </div>
-    <div id="demo-grid" class="mt-8 grid grid-cols-2 gap-4 sm:gap-5 flex-1 content-start"></div>
+    <div id="demo-grid" class="mt-6 sm:mt-8 grid grid-cols-2 gap-3 sm:gap-5 flex-1 content-start"></div>
   </section>
 </main>
 
 <!-- ======================= SCREEN 2: EDITOR ======================= -->
-<div id="screen-editor" class="hidden h-full flex flex-col">
-  <header class="h-14 shrink-0 flex items-center justify-between px-4 sm:px-5 bg-white border-b border-stone-200">
-    <div class="flex items-center gap-3">
-      <button id="btn-home" class="flex items-center gap-2.5" title="Back to start">
+<div id="screen-editor" class="hidden min-h-full lg:h-full flex flex-col">
+  <header class="h-14 shrink-0 flex items-center justify-between gap-2 px-3 sm:px-5 bg-white border-b border-stone-200">
+    <div class="flex items-center gap-2 sm:gap-3 min-w-0">
+      <button id="btn-home" class="flex items-center gap-2.5 shrink-0" title="Back to start" aria-label="Back to start">
         <div class="h-7 w-7 rounded-md bg-ink-900 grid place-items-center">
           <div class="grid grid-cols-2 gap-[2px]"><span class="h-[7px] w-[7px] bg-accent-400 rounded-[1px]"></span><span class="h-[7px] w-[7px] bg-white rounded-[1px]"></span><span class="h-[7px] w-[7px] bg-white rounded-[1px]"></span><span class="h-[7px] w-[7px] bg-accent-400 rounded-[1px]"></span></div>
         </div>
-        <span class="font-semibold tracking-tight text-sm hidden sm:inline">Smart Tile AI</span>
+        <span class="font-semibold tracking-tight text-sm hidden md:inline">Smart Tile AI</span>
       </button>
-      <span class="h-5 w-px bg-stone-200"></span>
-      <span id="room-name" class="text-sm text-stone-500 truncate max-w-[40vw]">Room</span>
+      <span class="h-5 w-px bg-stone-200 shrink-0"></span>
+      <span id="room-name" class="text-sm text-stone-500 truncate">Room</span>
     </div>
-    <div class="flex items-center gap-2">
-      <button id="btn-new-room" class="text-sm px-3 py-1.5 rounded-lg hover:bg-stone-100 text-stone-700">New room</button>
-      <button id="btn-keep" class="hidden text-sm px-3 py-1.5 rounded-lg border border-stone-200 hover:bg-stone-50 text-stone-700" title="Keep this render and tile another surface on top of it">Tile another surface</button>
-      <a id="btn-download" class="hidden text-sm px-3 py-1.5 rounded-lg bg-ink-900 text-white hover:bg-ink-700" download="tile-visualization.jpg">Download</a>
+    <div class="flex items-center gap-1 sm:gap-2 shrink-0">
+      <button id="btn-camera-top" class="h-9 px-2.5 sm:px-3 rounded-lg hover:bg-stone-100 text-stone-700 text-sm inline-flex items-center gap-1.5" title="Take a new photo" aria-label="Take Photo">
+        <svg class="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 9a2 2 0 012-2h1.5l1.4-2h8.2l1.4 2H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><circle cx="12" cy="13" r="3.5"/></svg>
+        <span class="hidden lg:inline">Take Photo</span>
+      </button>
+      <button id="btn-new-room" class="h-9 px-2.5 sm:px-3 rounded-lg hover:bg-stone-100 text-stone-700 text-sm" title="Choose another room">New<span class="hidden sm:inline"> room</span></button>
+      <button id="btn-keep" class="hidden h-9 px-2.5 sm:px-3 rounded-lg border border-stone-200 hover:bg-stone-50 text-stone-700 text-sm" title="Keep this render and tile another surface on top of it"><span class="sm:hidden">+ Surface</span><span class="hidden sm:inline">Tile another surface</span></button>
+      <div class="relative">
+        <button id="btn-download" class="hidden h-9 px-3 rounded-lg bg-ink-900 text-white hover:bg-ink-700 text-sm inline-flex items-center gap-1.5" aria-haspopup="menu" aria-expanded="false">
+          <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v11m0 0l-4-4m4 4l4-4M5 20h14"/></svg>
+          <span class="hidden sm:inline">Download</span>
+        </button>
+        <div id="download-menu" role="menu" class="hidden absolute right-0 top-11 z-40 w-60 rounded-xl bg-white shadow-2xl ring-1 ring-black/10 p-1.5 text-sm">
+          <a id="dl-image" role="menuitem" href="#" download="tile-visualization.jpg" class="flex items-center gap-2.5 rounded-lg px-3 py-2.5 hover:bg-stone-100">
+            <span class="text-base" aria-hidden="true">🖼️</span><span><span class="block font-medium">Download Image</span><span class="block text-xs text-stone-500">The rendered room (JPEG)</span></span>
+          </a>
+          <button id="dl-spec" role="menuitem" class="w-full text-left flex items-center gap-2.5 rounded-lg px-3 py-2.5 hover:bg-stone-100">
+            <span class="text-base" aria-hidden="true">📋</span><span><span class="block font-medium">Download Spec Sheet</span><span class="block text-xs text-stone-500">Before/after with tile specs</span></span>
+          </button>
+          <button id="dl-share" role="menuitem" class="hidden w-full text-left flex items-center gap-2.5 rounded-lg px-3 py-2.5 hover:bg-stone-100">
+            <span class="text-base" aria-hidden="true">💬</span><span><span class="block font-medium">Share Spec Sheet</span><span class="block text-xs text-stone-500">WhatsApp, email, messages…</span></span>
+          </button>
+        </div>
+      </div>
     </div>
   </header>
 
-  <div class="flex-1 min-h-0 flex flex-col lg:flex-row">
+  <!-- Pre-flight advisor: non-blocking, dismissible -->
+  <div id="advisor" class="hidden shrink-0 border-b border-stone-200 bg-white px-3 sm:px-5 py-2.5" role="status" aria-live="polite">
+    <div class="flex items-start gap-3">
+      <div id="advisor-list" class="flex-1 min-w-0 space-y-1.5"></div>
+      <button id="advisor-close" class="shrink-0 h-8 w-8 -mr-1 grid place-items-center rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700" aria-label="Dismiss photo advice">✕</button>
+    </div>
+  </div>
+
+  <div class="flex-1 lg:min-h-0 flex flex-col lg:flex-row">
     <!-- Canvas stage -->
-    <section class="relative flex-1 min-h-[55vh] bg-ink-950 overflow-hidden">
-      <div id="stage" class="absolute inset-0 flex items-center justify-center p-4 sm:p-8">
+    <section class="relative h-[58vh] min-h-[320px] lg:h-auto lg:min-h-0 lg:flex-1 bg-ink-950 overflow-hidden">
+      <div id="stage" class="absolute inset-0 flex items-center justify-center p-3 sm:p-8">
         <canvas id="canvas" class="rounded-lg shadow-2xl shadow-black/50 cursor-crosshair"></canvas>
       </div>
 
       <!-- floating toolbar -->
-      <div class="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-1 rounded-full bg-ink-900/85 backdrop-blur px-1.5 py-1.5 text-white text-xs shadow-lg ring-1 ring-white/10">
-        <div id="hint-edit" class="flex items-center gap-3 px-3">
-          <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"></span>Left-click include</span>
-          <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-rose-500 ring-2 ring-rose-500/30"></span>Right-click exclude</span>
+      <div id="toolbar" class="absolute top-3 sm:top-4 inset-x-2 mx-auto w-fit max-w-[calc(100%-1rem)] whitespace-nowrap flex items-center gap-1 rounded-full bg-ink-900/85 backdrop-blur px-1.5 py-1.5 text-white text-xs shadow-lg ring-1 ring-white/10 overflow-x-auto no-scrollbar">
+        <div id="hint-edit" class="mode flex items-center gap-0.5 shrink-0" role="group" aria-label="Tap mode">
+          <button id="mode-include" aria-pressed="true" class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-white/70 hover:text-white" title="Taps add the surface (left-click)">
+            <span class="h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"></span>Include
+          </button>
+          <button id="mode-exclude" aria-pressed="false" class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-white/70 hover:text-white" title="Taps remove objects (or right-click anytime)">
+            <span class="h-2.5 w-2.5 rounded-full bg-rose-500 ring-2 ring-rose-500/30"></span>Exclude
+          </button>
         </div>
-        <div id="hint-result" class="hidden px-3">Drag to compare before / after</div>
-        <span class="h-4 w-px bg-white/15"></span>
-        <button id="btn-undo" class="px-2.5 py-1 rounded-full hover:bg-white/10 disabled:opacity-40" title="Undo last point (Ctrl+Z)">Undo</button>
-        <button id="btn-clear" class="px-2.5 py-1 rounded-full hover:bg-white/10 disabled:opacity-40">Clear</button>
-        <button id="btn-view" class="hidden px-2.5 py-1 rounded-full bg-white/10 hover:bg-white/20">Edit selection</button>
-        <span id="seg-busy" class="hidden items-center gap-1.5 px-2.5 text-accent-300"><span class="h-3 w-3 rounded-full border-2 border-accent-300 border-t-transparent orbit"></span>Segmenting</span>
+        <div id="hint-result" class="hidden px-3 shrink-0">Drag to compare before / after</div>
+        <span class="h-4 w-px bg-white/15 shrink-0"></span>
+        <button id="btn-undo" class="px-2.5 py-1.5 rounded-full hover:bg-white/10 disabled:opacity-40 shrink-0" title="Undo last point (Ctrl+Z)">Undo</button>
+        <button id="btn-clear" class="px-2.5 py-1.5 rounded-full hover:bg-white/10 disabled:opacity-40 shrink-0">Clear</button>
+        <button id="btn-view" class="hidden px-2.5 py-1.5 rounded-full bg-white/10 hover:bg-white/20 shrink-0">Edit selection</button>
+        <span id="seg-busy" class="hidden items-center gap-1.5 px-2.5 text-accent-300 shrink-0"><span class="h-3 w-3 rounded-full border-2 border-accent-300 border-t-transparent orbit"></span><span class="hidden sm:inline">Segmenting</span></span>
       </div>
 
-      <div id="render-info" class="hidden absolute bottom-4 left-4 rounded-lg bg-ink-900/80 backdrop-blur text-[11px] text-stone-300 px-3 py-2 ring-1 ring-white/10"></div>
+      <div id="render-info" class="hidden absolute bottom-3 left-3 sm:bottom-4 sm:left-4 max-w-[calc(100%-1.5rem)] rounded-lg bg-ink-900/80 backdrop-blur text-[11px] text-stone-300 px-3 py-2 ring-1 ring-white/10"></div>
 
       <!-- premium loading overlay -->
       <div id="loading" class="hidden absolute inset-0 z-20 bg-ink-950/60 backdrop-blur-md grid place-items-center">
-        <div class="w-[min(360px,85%)] rounded-2xl bg-white/95 p-6 shadow-2xl">
+        <div class="w-[min(360px,88%)] rounded-2xl bg-white/95 p-5 sm:p-6 shadow-2xl">
           <div class="flex items-center gap-4">
             <div class="relative h-11 w-11">
               <div class="absolute inset-0 rounded-full border-[3px] border-stone-200"></div>
@@ -154,16 +207,16 @@
     </section>
 
     <!-- Sidebar -->
-    <aside class="w-full lg:w-[390px] shrink-0 bg-white border-l border-stone-200 flex flex-col min-h-0">
-      <div class="flex-1 overflow-y-auto scroll-thin px-5 py-5 space-y-7">
+    <aside class="w-full lg:w-[400px] shrink-0 bg-white lg:border-l border-stone-200 flex flex-col lg:min-h-0">
+      <div class="flex-1 lg:overflow-y-auto scroll-thin px-4 sm:px-5 py-5 space-y-7">
 
         <section>
           <div class="flex items-center justify-between">
             <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">1 · Surface</h3>
             <span id="mask-status" class="text-xs text-stone-400">No selection</span>
           </div>
-          <p class="text-sm text-stone-600 mt-2">Click the floor or wall in the photo. People and furniture are cut out automatically; right-click anything else to keep it out.</p>
-          <label class="mt-3 flex items-center justify-between rounded-lg bg-stone-50 border border-stone-200 px-3 py-2 cursor-pointer">
+          <p class="text-sm text-stone-600 mt-2">Tap the floor or wall in the photo. People and furniture are cut out automatically; switch to <span class="font-medium text-rose-600">Exclude</span> (or right-click) to keep anything else out.</p>
+          <label class="mt-3 flex items-center justify-between gap-3 rounded-lg bg-stone-50 border border-stone-200 px-3 py-2 cursor-pointer">
             <span class="text-sm">
               <span class="font-medium">Auto-exclude people &amp; objects</span>
               <span id="auto-excluded" class="block text-xs text-stone-500">Detected objects are outlined in rose</span>
@@ -174,12 +227,23 @@
               <span class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform peer-checked:translate-x-4"></span>
             </span>
           </label>
+          <label class="mt-2 flex items-center justify-between gap-3 rounded-lg bg-stone-50 border border-stone-200 px-3 py-2 cursor-pointer">
+            <span class="text-sm">
+              <span class="font-medium">Straighten architectural edges</span>
+              <span id="straight-status" class="block text-xs text-stone-500">Snaps ragged floor–wall junctions to clean lines</span>
+            </span>
+            <span class="relative inline-flex shrink-0">
+              <input id="straighten" type="checkbox" class="peer sr-only" checked>
+              <span class="h-5 w-9 rounded-full bg-stone-300 peer-checked:bg-accent-500 transition-colors"></span>
+              <span class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform peer-checked:translate-x-4"></span>
+            </span>
+          </label>
           <div class="mt-3">
-            <label class="text-xs text-stone-500">Surface type</label>
+            <span class="text-xs text-stone-500">Surface type</span>
             <div class="seg mt-1.5 grid grid-cols-3 gap-1 rounded-lg bg-stone-100 p-1 text-sm" role="group" id="surface-seg">
-              <button data-v="auto" aria-pressed="true" class="rounded-md py-1.5 text-stone-600">Auto</button>
-              <button data-v="floor" aria-pressed="false" class="rounded-md py-1.5 text-stone-600">Floor</button>
-              <button data-v="wall" aria-pressed="false" class="rounded-md py-1.5 text-stone-600">Wall</button>
+              <button data-v="auto" aria-pressed="true" class="rounded-md py-2 text-stone-600">Auto</button>
+              <button data-v="floor" aria-pressed="false" class="rounded-md py-2 text-stone-600">Floor</button>
+              <button data-v="wall" aria-pressed="false" class="rounded-md py-2 text-stone-600">Wall</button>
             </div>
           </div>
         </section>
@@ -187,11 +251,18 @@
         <section>
           <div class="flex items-center justify-between">
             <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">2 · Tile</h3>
-            <label class="text-xs text-accent-700 font-medium cursor-pointer hover:underline">
+            <label class="text-xs text-accent-700 font-medium cursor-pointer hover:underline py-1">
               Upload tile<input id="tile-input" type="file" accept="image/*" class="sr-only">
             </label>
           </div>
-          <div id="tile-grid" class="mt-3 grid grid-cols-4 gap-2"></div>
+          <div id="best-matches" class="hidden mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3">
+            <div class="flex items-center justify-between gap-2">
+              <p class="text-xs font-semibold text-amber-900">✨ Best matches for this room</p>
+              <div id="room-palette" class="flex -space-x-1" title="Room colour palette"></div>
+            </div>
+            <div id="best-list" class="mt-2 space-y-1.5"></div>
+          </div>
+          <div id="tile-grid" class="mt-3 grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-4 gap-2"></div>
           <p id="tile-name" class="mt-2 text-sm font-medium truncate">—</p>
         </section>
 
@@ -200,34 +271,73 @@
           <div class="mt-3 grid grid-cols-[1fr_auto_1fr] items-end gap-2">
             <label class="block">
               <span class="text-xs text-stone-500">Width (mm)</span>
-              <input id="tile-w" type="number" min="10" max="5000" value="600" class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20 outline-none">
+              <input id="tile-w" type="number" inputmode="numeric" min="10" max="5000" value="600" class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-base sm:text-sm focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20 outline-none">
             </label>
-            <button id="btn-swap" class="mb-1 h-8 w-8 grid place-items-center rounded-lg hover:bg-stone-100 text-stone-500" title="Swap width and height">⇄</button>
+            <button id="btn-swap" class="mb-1 h-9 w-9 grid place-items-center rounded-lg hover:bg-stone-100 text-stone-500" title="Swap width and height" aria-label="Swap width and height">⇄</button>
             <label class="block">
               <span class="text-xs text-stone-500">Height (mm)</span>
-              <input id="tile-h" type="number" min="10" max="5000" value="600" class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20 outline-none">
+              <input id="tile-h" type="number" inputmode="numeric" min="10" max="5000" value="600" class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-base sm:text-sm focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20 outline-none">
             </label>
           </div>
           <div id="size-presets" class="mt-2.5 flex flex-wrap gap-1.5 text-xs"></div>
           <div class="mt-5">
             <div class="flex justify-between text-xs"><span class="text-stone-500">Scale</span><span id="scale-val" class="font-medium tabular-nums">1.00×</span></div>
-            <input id="scale" type="range" min="0.25" max="3" step="0.05" value="1" class="w-full mt-1.5">
+            <input id="scale" type="range" min="0.25" max="3" step="0.05" value="1" class="w-full mt-1.5" aria-label="Scale">
+          </div>
+          <div class="mt-5">
+            <span class="text-xs text-stone-500">Orientation</span>
+            <div class="seg mt-1.5 grid grid-cols-3 gap-1 rounded-lg bg-stone-100 p-1 text-xs sm:text-sm" role="group" id="orient-seg">
+              <button data-v="0" aria-pressed="true" class="rounded-md py-2 text-stone-600">0° <span class="text-stone-400">Standard</span></button>
+              <button data-v="90" aria-pressed="false" class="rounded-md py-2 text-stone-600">90° <span class="text-stone-400">Rotated</span></button>
+              <button data-v="45" aria-pressed="false" class="rounded-md py-2 text-stone-600">45° <span class="text-stone-400">Diamond</span></button>
+            </div>
+          </div>
+          <div class="mt-4">
+            <span class="text-xs text-stone-500">Laying pattern</span>
+            <div class="seg mt-1.5 grid grid-cols-2 gap-1 rounded-lg bg-stone-100 p-1 text-sm" role="group" id="pattern-seg">
+              <button data-v="standard" aria-pressed="true" class="rounded-md py-2 text-stone-600">Standard Grid</button>
+              <button data-v="brick" aria-pressed="false" class="rounded-md py-2 text-stone-600">Brick / Running Bond</button>
+              <button data-v="herringbone" aria-pressed="false" class="rounded-md py-2 text-stone-600">Herringbone</button>
+              <button data-v="checkerboard" aria-pressed="false" class="rounded-md py-2 text-stone-600">Checkerboard</button>
+            </div>
+            <p id="pattern-hint" class="hidden mt-1.5 text-xs text-amber-700"></p>
           </div>
         </section>
 
         <section>
-          <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">4 · Finish</h3>
-          <label class="mt-3 flex items-center justify-between rounded-xl border border-stone-200 px-4 py-3 cursor-pointer hover:bg-stone-50">
+          <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">4 · Grout</h3>
+          <div class="mt-3">
+            <div class="flex justify-between text-xs"><span class="text-stone-500">Joint width</span><span id="grout-val" class="font-medium tabular-nums">2.0 mm</span></div>
+            <input id="grout-mm" type="range" min="0" max="10" step="0.5" value="2" class="w-full mt-1.5" aria-label="Grout width in millimetres">
+            <div class="flex justify-between text-[10px] text-stone-400"><span>0 mm seamless</span><span>10 mm</span></div>
+          </div>
+          <div class="mt-3">
+            <span class="text-xs text-stone-500">Colour · <span id="grout-name" class="text-stone-700 font-medium">Auto (tile-matched)</span></span>
+            <div id="grout-swatches" class="mt-2 flex flex-wrap items-center gap-2.5" role="group" aria-label="Grout colour"></div>
+          </div>
+        </section>
+
+        <section>
+          <h3 class="text-[11px] font-semibold uppercase tracking-[.16em] text-stone-500">5 · Finish &amp; lighting</h3>
+          <label class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-stone-200 px-4 py-3 cursor-pointer hover:bg-stone-50">
             <span>
               <span class="block text-sm font-medium">Glossy finish</span>
               <span class="block text-xs text-stone-500">Polished reflections and specular highlights</span>
             </span>
-            <span class="relative inline-flex">
+            <span class="relative inline-flex shrink-0">
               <input id="glossy" type="checkbox" class="peer sr-only">
               <span class="h-6 w-11 rounded-full bg-stone-300 peer-checked:bg-accent-500 transition-colors"></span>
               <span class="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform peer-checked:translate-x-5"></span>
             </span>
           </label>
+          <div class="mt-3">
+            <span class="text-xs text-stone-500">Lighting mood</span>
+            <div class="seg mt-1.5 grid grid-cols-3 gap-1 rounded-lg bg-stone-100 p-1 text-xs sm:text-sm" role="group" id="mood-seg">
+              <button data-v="natural" aria-pressed="true" class="rounded-md py-2 px-1 text-stone-600">☀️ Natural<span class="block text-[10px] text-stone-400">Original</span></button>
+              <button data-v="warm" aria-pressed="false" class="rounded-md py-2 px-1 text-stone-600">🌅 Warm Evening<span class="block text-[10px] text-stone-400">3000K</span></button>
+              <button data-v="cool" aria-pressed="false" class="rounded-md py-2 px-1 text-stone-600">❄️ Cool Daylight<span class="block text-[10px] text-stone-400">6500K</span></button>
+            </div>
+          </div>
         </section>
 
         <section class="border-t border-stone-200 pt-5">
@@ -242,7 +352,7 @@
         </section>
       </div>
 
-      <div class="p-4 border-t border-stone-200 bg-white">
+      <div class="sticky bottom-0 z-10 p-3 sm:p-4 border-t border-stone-200 bg-white/95 backdrop-blur" style="padding-bottom: max(.75rem, env(safe-area-inset-bottom));">
         <button id="btn-render" disabled class="group relative w-full overflow-hidden rounded-xl bg-ink-900 text-white py-3.5 font-medium shadow-lg shadow-ink-900/20 hover:bg-ink-800 disabled:bg-stone-300 disabled:shadow-none disabled:cursor-not-allowed transition-colors">
           <span class="relative z-10">Render Photorealistic Surface</span>
           <span class="absolute inset-0 opacity-0 group-hover:opacity-100 group-disabled:opacity-0 shimmer"></span>
@@ -253,7 +363,50 @@
   </div>
 </div>
 
-<div id="toast" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-50 rounded-xl bg-ink-900 text-white text-sm px-4 py-3 shadow-2xl max-w-[90vw]"></div>
+<!-- ======================= CAMERA CAPTURE (level guide) ======================= -->
+<div id="camera-modal" class="hidden fixed inset-0 z-50 bg-black text-white flex flex-col" role="dialog" aria-modal="true" aria-label="Take a room photo">
+  <div class="relative flex-1 min-h-0 overflow-hidden">
+    <video id="cam-video" playsinline autoplay muted class="absolute inset-0 h-full w-full object-contain"></video>
+    <div id="cam-frame" class="absolute inset-0 pointer-events-none">
+    <div class="cam-grid absolute inset-0"></div>
+    <!-- crosshair -->
+    <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
+      <div class="absolute left-1/2 top-1/2 h-px w-10 -translate-x-1/2 bg-white/80"></div>
+      <div class="absolute left-1/2 top-1/2 w-px h-10 -translate-y-1/2 bg-white/80"></div>
+      <div class="h-14 w-14 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/60 absolute"></div>
+    </div>
+    <!-- spirit level: a world-level line plus the phone's own horizon -->
+    <div class="absolute left-1/2 top-1/2 w-[70%] -translate-x-1/2 -translate-y-1/2 pointer-events-none">
+      <div class="h-px w-full bg-white/30"></div>
+      <div id="level-line" class="level-line absolute left-0 top-0 h-[3px] -mt-px w-full rounded-full bg-white/70 shadow"></div>
+    </div>
+    <!-- pitch bubble (right edge): centred band = chest-height range -->
+    <div class="absolute right-3 top-1/2 -translate-y-1/2 h-40 w-3 rounded-full bg-white/15 pointer-events-none" aria-hidden="true">
+      <div class="absolute inset-x-0 top-[38%] h-[24%] rounded-full bg-emerald-400/30"></div>
+      <div id="pitch-bubble" class="absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow"></div>
+    </div>
+    </div>
+    <div class="absolute top-0 inset-x-0 p-3 flex flex-col items-center gap-2" style="padding-top: max(.75rem, env(safe-area-inset-top));">
+      <div id="cam-status" class="rounded-full bg-black/60 backdrop-blur px-4 py-2 text-sm font-medium text-center max-w-[92%]">Starting camera…</div>
+      <div id="cam-readout" class="text-xs text-white/70 tabular-nums"></div>
+    </div>
+    <div id="cam-error" class="hidden absolute inset-0 grid place-items-center p-6 text-center">
+      <div class="max-w-sm">
+        <p id="cam-error-text" class="text-sm text-white/80">The live camera isn't available.</p>
+        <button id="cam-fallback" class="mt-4 rounded-xl bg-white text-ink-900 font-medium px-5 py-3">Use phone camera app</button>
+      </div>
+    </div>
+  </div>
+  <div class="shrink-0 flex items-center justify-between px-6 py-5 bg-black" style="padding-bottom: max(1.25rem, env(safe-area-inset-bottom));">
+    <button id="cam-cancel" class="text-sm text-white/80 px-3 py-2 min-w-[72px] text-left">Cancel</button>
+    <button id="cam-shutter" class="h-[72px] w-[72px] rounded-full border-4 border-white grid place-items-center disabled:opacity-40" aria-label="Capture photo" disabled>
+      <span class="h-14 w-14 rounded-full bg-white"></span>
+    </button>
+    <button id="cam-native" class="text-sm text-white/80 px-3 py-2 min-w-[72px] text-right">Camera app</button>
+  </div>
+</div>
+
+<div id="toast" class="hidden fixed bottom-24 lg:bottom-5 left-1/2 -translate-x-1/2 z-[60] rounded-xl bg-ink-900 text-white text-sm px-4 py-3 shadow-2xl max-w-[90vw]" role="status" aria-live="polite"></div>
 
 <script src="/static/app.js"></script>
 </body>
