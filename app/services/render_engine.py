@@ -5,9 +5,9 @@ Pipeline (all arrays RGB):
      disparity is exactly an affine function of pixel position, so a RANSAC plane
      fit in (x, y, disparity) space recovers the rigid plane (up to the depth
      model's unknown shift) while ignoring clutter that leaked into the mask.
-     Camera roll comes from the room's vertical lines; walls are then forced
-     exactly vertical and floors exactly horizontal. Hough-line vanishing points
-     (or an eye-level prior) fix the remaining shift.
+     Camera roll comes from the room's vertical lines and floors are forced exactly
+     horizontal; Hough-line vanishing points (or an eye-level prior) fix the remaining
+     shift. Walls are rendered facing the camera, level and plumb (WALL_PERSPECTIVE).
   2. Every pixel is cast onto that single plane, giving metric (u, v) coordinates.
      Tile courses are therefore straight lines by construction: no depth-driven warp.
   3. Tiles: the tile photo (uniform borders auto-cropped) is sampled with
@@ -37,6 +37,7 @@ WALL_DISTANCE_M = 3.0         # typical camera-to-wall distance for interior sho
 MAX_PERSPECTIVE = 0.95        # cap on far/near compression, keeps the horizon off the surface
 MAX_FLOOR_ROTATION_DEG = 15.0 # larger detected angles are clutter (chairs, desks), not room architecture
 MAX_WALL_PERSPECTIVE = 0.6    # walls: far edge at most 2.5x the near edge's distance
+WALL_PERSPECTIVE = False      # walls: estimate yaw (vanishing lines / depth)? Off: always laid level, facing the camera
 WALL_VP_MAX_ANGLE_DEG = 30.0  # only near-horizontal segments can vote for a wall's vanishing point
 WALL_VP_EYE_BAND = 0.2        # ...and their crossing must lie within +-20% of image height of eye level
 HIGHLIGHT_HEADROOM = (0.5, 0.7)   # max extra brightening above average light: (matte, glossy)
@@ -362,7 +363,12 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     segs = _detect_segments(gray, band)
 
     t, source = None, "fronto-parallel"
-    if span > 1e-3:
+    # Walls are rendered facing the camera, so courses are exactly level and columns exactly
+    # plumb in the image. Their yaw can't be recovered reliably: the disparity slope
+    # across a nearly frontal wall is dominated by Depth Anything's unknown shift (an office
+    # wall seen head-on came out yawed 36 deg, with courses sloping AGAINST the room's own
+    # lines), and the ceiling, AC units and furniture feed stray vanishing points.
+    if span > 1e-3 and (surface == "floor" or WALL_PERSPECTIVE):
         # Walls: how much perspective the depth map itself supports. On a nearly frontal
         # wall the disparity gradient is tiny, so any vanishing point gets huge leverage;
         # stray converging lines just off the wall (sofa backs, cushions) must not turn it
@@ -408,9 +414,13 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     normal = np.array([f * horizon[0], f * horizon[1], cx * horizon[0] + cy * horizon[1] + horizon[2]])
     normal /= np.linalg.norm(normal)
 
-    # Walls: tile columns follow gravity (roll-corrected), so they line up with door frames.
-    # Floors: tile courses run away from the camera.
+    # Floors: tile courses run away from the camera, around roll-corrected gravity.
+    # Walls: columns exactly image-vertical (0 deg). The roll read from the room's lines is
+    # unreliable on walls: in a bathroom photo whose window frame is perfectly vertical it
+    # read 4.2 deg, from lines leaning with camera pitch, and tilted the whole grid with it.
     gravity = np.array([down[0], down[1], 0.0])
+    if surface == "wall" and not WALL_PERSPECTIVE:
+        gravity = np.array([0.0, 1.0, 0.0])
     refs = [np.array([0.0, 0.0, 1.0]), gravity] if surface == "floor" else [gravity, np.array([0.0, 0.0, 1.0])]
     for ref in refs:
         e2 = ref - (ref @ normal) * normal
@@ -421,9 +431,7 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     if e1[0] < 0:
         e1 = -e1
 
-    # Wall tiles are always laid level, so only floors take their rotation from the room's lines.
-    # Walls: rotation is always 0, whichever method set the perspective (vanishing lines,
-    # depth or fronto-parallel). Tiles on a wall are laid level.
+    # Grid rotation from the room's lines is for floors only; wall grids are always at 0 deg.
     rot = 0.0
     if surface == "floor" and t is not None:
         rot = _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy, image_w=w)

@@ -11,6 +11,8 @@ EXCLUDED_COLOR = np.array([244, 63, 94], dtype=np.float32)   # rose-500: auto-ex
 # (white wall meeting white ceiling, raw concrete) score 0.04-0.08; lines drawn across
 # SAM speckle or along an irregular outline score under 0.01.
 STRAIGHT_MIN_SUPPORT = 0.02
+STRAIGHT_MAX_FOREIGN = 1.0     # px of far-side-looking area per px of line before a line is refused...
+STRAIGHT_MIN_SEPARATION = 10.0  # ...when the two sides differ clearly enough in colour (LAB) to judge
 
 
 def _guided_filter(guide, src, radius, eps):
@@ -307,12 +309,8 @@ def _is_wiggle_not_curve(t, s, tol):
     return rms_quad > 0.6 * rms_line
 
 
-def _edge_support(grad, centre, d, n, half_len):
-    """Median photo gradient across a line segment (0 = no edge along it).
-
-    The MEDIAN over samples along the whole segment, so only an edge that runs along most
-    of it scores, not a few crossing object edges or a curvy outline the line cuts through.
-    """
+def _edge_samples(grad, centre, d, n, half_len):
+    """|gradient . n| and |gradient . d| sampled along a line segment, or None if mostly off-image."""
     gx, gy = grad
     h, w = gx.shape
     ts = np.linspace(-half_len, half_len, max(8, int(half_len)))
@@ -320,9 +318,20 @@ def _edge_support(grad, centre, d, n, half_len):
     py = centre[1] + ts * d[1]
     ok = (px >= 0) & (px <= w - 1) & (py >= 0) & (py <= h - 1)
     if ok.sum() < 0.7 * len(ts):
-        return -1.0
+        return None
     xi, yi = np.round(px[ok]).astype(int), np.round(py[ok]).astype(int)
-    return float(np.median(np.abs(gx[yi, xi] * n[0] + gy[yi, xi] * n[1])))
+    g = np.stack([gx[yi, xi], gy[yi, xi]], axis=1)
+    return np.abs(g @ n), np.abs(g @ d)
+
+
+def _edge_support(grad, centre, d, n, half_len):
+    """Median photo gradient across a line segment (0 = no edge along it).
+
+    The MEDIAN over samples along the whole segment, so only an edge that runs along most
+    of it scores, not a few crossing object edges or a curvy outline the line cuts through.
+    """
+    samples = _edge_samples(grad, centre, d, n, half_len)
+    return -1.0 if samples is None else float(np.median(samples[0]))
 
 
 def _snap_line_to_edge(grad, centre, d, n, half_len, search):
@@ -346,6 +355,64 @@ def _snap_line_to_edge(grad, centre, d, n, half_len, search):
     if best[0] > max(1.25 * base, 0.04):
         return best[1], best[2], best[3], best[0]
     return centre, d, n, base
+
+
+def _foreign_intrusion(lab, pts_r, i0, i1, c, d, nrm, half, tol):
+    """(foreign intrusion in px, separation) for the pixels a straightened edge would ADD.
+
+    The fallback against texture. Next to blinds, curtains or cladding, the "edge" a line
+    snaps to can sit inside the texture, and replacing SAM's contour with it would paint
+    tiles over slats. Locally, the colours just inside the surface and just beyond the
+    line are modelled (k-means in LAB); every pixel the line adds is assigned to the nearer
+    model. Intrusion is the far-side-looking area per unit of line length, i.e. how many px
+    deep the line reaches into the other material on average. Pixels within 2.5 px of the
+    line are left out: they are the edge's own anti-aliased transition, half one material
+    and half the other, wherever the true edge is. separation: how far the far side's
+    colours are from the surface's. On a low-contrast junction (raw concrete on concrete)
+    the test can't tell the sides apart, so the caller only applies it when the separation
+    is clear.
+    """
+    h, w = lab.shape[:2]
+    reach = 3.0 * tol + 3.0
+    ends = np.array([c - (half + reach) * d, c + (half + reach) * d])
+    x0 = int(max(0, np.floor(ends[:, 0].min() - reach)))
+    x1 = int(min(w, np.ceil(ends[:, 0].max() + reach) + 1))
+    y0 = int(max(0, np.floor(ends[:, 1].min() - reach)))
+    y1 = int(min(h, np.ceil(ends[:, 1].max() + reach) + 1))
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return 0.0, 0.0
+    off = np.array([x0, y0])
+    orig = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillPoly(orig, [np.round(pts_r - off).astype(np.int32)], 1)
+    new_pts = pts_r.copy()
+    seg = pts_r[i0:i1 + 1]
+    new_pts[i0:i1 + 1] = c + np.outer((seg - c) @ d, d)
+    new = np.zeros_like(orig)
+    cv2.fillPoly(new, [np.round(new_pts - off).astype(np.int32)], 1)
+
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    rel = np.stack([xs - c[0], ys - c[1]], axis=-1)
+    along, across = rel @ d, rel @ nrm
+    in_strip = np.abs(along) <= half
+    added = (new > 0) & (orig == 0) & in_strip
+    if added.sum() < 20:
+        return 0.0, 0.0
+    # Which side of the line is the surface: the side the new fill covers.
+    side = 1.0 if (new[in_strip & (across > 0)] > 0).mean() >= (new[in_strip & (across < 0)] > 0).mean() else -1.0
+    dist = across * side
+    inside = in_strip & (orig > 0) & (dist > tol + 2) & (dist <= reach)
+    beyond = in_strip & (orig == 0) & (dist < -(tol + 2)) & (dist >= -reach)
+    if inside.sum() < 30 or beyond.sum() < 30:
+        return 0.0, 0.0
+    crop = lab[y0:y1, x0:x1]
+    pal_in, pal_out = _palette(crop[inside], 3), _palette(crop[beyond], 3)
+    separation = float(np.median(_nearest(crop[beyond], pal_in)))
+    deep = added & (dist > 2.5)
+    if not deep.any():
+        return 0.0, separation
+    feats = crop[deep]
+    foreign = _nearest(feats, pal_out) < _nearest(feats, pal_in)
+    return float(foreign.sum()) / max(2.0 * half, 1.0), separation
 
 
 def straighten_boundaries(image_np, binary, protect=None, negative_clicks=(), diagnostics=None):
@@ -379,6 +446,7 @@ def straighten_boundaries(image_np, binary, protect=None, negative_clicks=(), di
         blocked |= cv2.dilate(protect.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
 
     gray = cv2.GaussianBlur(cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0, (0, 0), 1.5)
+    lab = cv2.cvtColor(cv2.GaussianBlur(image_np, (3, 3), 0), cv2.COLOR_RGB2LAB).astype(np.float32)
     grad = (cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
     negs = np.array(negative_clicks, dtype=np.float64).reshape(-1, 2)
 
@@ -430,10 +498,16 @@ def straighten_boundaries(image_np, binary, protect=None, negative_clicks=(), di
                 half = 0.5 * (t.max() - t.min())
                 c = c + 0.5 * (t.max() + t.min()) * d
                 c, d, nrm, support = _snap_line_to_edge(grad, c, d, nrm, half, int(round(tol)))
+                foreign, separation = _foreign_intrusion(lab, pts_r, r0 + a, r0 + b, c, d, nrm, half, tol)
                 if diagnostics is not None:
                     diagnostics.append({"p0": (c - half * d).round(1).tolist(), "p1": (c + half * d).round(1).tolist(),
-                                        "support": round(support, 4), "wiggle_rms": round(float(s.std()), 2)})
+                                        "support": round(support, 4), "foreign": round(foreign, 2),
+                                        "separation": round(separation, 1), "wiggle_rms": round(float(s.std()), 2)})
                 if support < STRAIGHT_MIN_SUPPORT:
+                    continue
+                # Fallback: the line would pull in pixels that look like what lies beyond
+                # it (blind slats, curtain folds), so keep SAM's own smoothed contour.
+                if separation >= STRAIGHT_MIN_SEPARATION and foreign > STRAIGHT_MAX_FOREIGN:
                     continue
                 # Skip when an exclude click sits in the strip this edge would rewrite.
                 if len(negs):
