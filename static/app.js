@@ -132,6 +132,10 @@ async function openRoom(src, name) {
     state.roomUrl = url;
     state.originalImg = img;
     state.roomName = name;
+    // A Floor/Wall choice belongs to the previous photo: carried over, it forced the next
+    // room's walls through the floor projection.
+    state.surface = 'auto';
+    setPressed('surface-seg', 'auto');
     $('room-name').textContent = `${name} · ${img.naturalWidth}×${img.naturalHeight}`;
     resetSelection();
     clearResult();
@@ -780,12 +784,13 @@ function showRenderInfo(raw) {
   const el = $('render-info');
   try {
     const info = JSON.parse(raw);
-    const bits = [`perspective from ${esc(info.horizon_source)}`];
+    const bits = [info.surface === 'wall' ? 'flat, level & plumb' : `perspective from ${esc(info.horizon_source)}`];
     if (info.grid_rotation_deg) bits.push(`grid ${esc(info.grid_rotation_deg)}°`);
     if (info.pattern && info.pattern !== 'standard') bits.push(esc(PATTERN_NAMES[info.pattern] || info.pattern));
     if (info.mood && info.mood !== 'natural') bits.push(esc(MOOD_NAMES[info.mood] || info.mood));
     el.innerHTML = `<span class="text-white font-medium capitalize">${esc(info.surface)}</span> · ${bits.join(' · ')}`;
     el.classList.remove('hidden');
+    if (info.surface_override) toast('This selection is a wall, not a floor, so it was tiled as a wall.', 6000);
   } catch { el.classList.add('hidden'); }
 }
 

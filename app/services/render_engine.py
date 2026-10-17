@@ -7,7 +7,7 @@ Pipeline (all arrays RGB):
      model's unknown shift) while ignoring clutter that leaked into the mask.
      Camera roll comes from the room's vertical lines and floors are forced exactly
      horizontal; Hough-line vanishing points (or an eye-level prior) fix the remaining
-     shift. Walls are rendered facing the camera, level and plumb (WALL_PERSPECTIVE).
+     shift. Walls skip all of this: a flat 2D mapping, level and plumb (wall_plane).
   2. Every pixel is cast onto that single plane, giving metric (u, v) coordinates.
      Tile courses are therefore straight lines by construction: no depth-driven warp.
   3. Tiles: the tile photo (uniform borders auto-cropped) is sampled with
@@ -37,7 +37,8 @@ WALL_DISTANCE_M = 3.0         # typical camera-to-wall distance for interior sho
 MAX_PERSPECTIVE = 0.95        # cap on far/near compression, keeps the horizon off the surface
 MAX_FLOOR_ROTATION_DEG = 15.0 # larger detected angles are clutter (chairs, desks), not room architecture
 MAX_WALL_PERSPECTIVE = 0.6    # walls: far edge at most 2.5x the near edge's distance
-WALL_PERSPECTIVE = False      # walls: estimate yaw (vanishing lines / depth)? Off: always laid level, facing the camera
+WALL_PERSPECTIVE = False      # walls: estimate yaw (vanishing lines / depth)? Off: flat 2D mapping (wall_plane)
+FLOOR_MIN_BOTTOM = 0.8        # a floor selection reaches at least this far down the frame (or sits in its lower half)
 WALL_VP_MAX_ANGLE_DEG = 30.0  # only near-horizontal segments can vote for a wall's vanishing point
 WALL_VP_EYE_BAND = 0.2        # ...and their crossing must lie within +-20% of image height of eye level
 HIGHLIGHT_HEADROOM = (0.5, 0.7)   # max extra brightening above average light: (matte, glossy)
@@ -331,6 +332,45 @@ def _grid_rotation(segs, horizon, normal, e1, e2, f, cx, cy, image_w=None):
     return float(np.radians(rot))
 
 
+def wall_plane(h, w, roll=0.0):
+    """Flat 2D wall mapping: (u, v) = ((x - cx) * s, (y - cy) * s) metres, s = WALL_DISTANCE_M / f.
+
+    A wall is laid like wallpaper on the image plane: u depends only on x and v only on y,
+    with one scale for both axes, so courses are exactly level, columns exactly plumb and a
+    600x600 tile stays square everywhere in the frame. No depth model and no vanishing
+    points are involved. Wall yaw can't be recovered reliably from one photo: the
+    disparity slope across a nearly frontal wall is dominated by Depth Anything's unknown
+    shift (an office wall seen head-on came out yawed 36 deg, courses sloping AGAINST the
+    room's own lines), the ceiling, AC units and furniture feed stray vanishing points, and
+    the roll read from the room's lines tilted a bathroom grid 4.2 deg although its window
+    frame is vertical. (WALL_PERSPECTIVE = True restores the 3D estimate.)
+    """
+    f, cx, cy = FOCAL_FACTOR * max(w, h), w / 2.0, h / 2.0
+    info = {
+        "surface": "wall",
+        "horizon_source": "flat 2D wall",
+        "line_segments": 0,
+        "grid_rotation_deg": 0.0,
+        "roll_deg": round(float(np.degrees(roll)), 1),
+        "plane_inliers": None,
+        "normal": [0.0, 0.0, 1.0],
+    }
+    return PlaneGeometry("wall", np.array([0.0, 0.0, 1.0]), WALL_DISTANCE_M,
+                         np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), f, cx, cy, info)
+
+
+def plausible_floor(mask_bin):
+    """False when a mask can't be a floor: it stays in the upper part of the frame.
+
+    A floor lies below the horizon and, in a room photo, runs down towards the lower edge
+    of the frame. A selection that neither reaches the bottom FLOOR_MIN_BOTTOM of the
+    frame nor sits mostly in its lower half is a wall, whatever the request said.
+    """
+    ys = np.nonzero(mask_bin)[0]
+    h = mask_bin.shape[0]
+    return bool(np.percentile(ys, 98) / h >= FLOOR_MIN_BOTTOM or ys.mean() / h >= 0.55)
+
+
 def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     h, w = mask_bin.shape
     f, cx, cy = FOCAL_FACTOR * max(w, h), w / 2.0, h / 2.0
@@ -345,6 +385,8 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     fit_mask = eroded if eroded.sum() > 500 else mask_bin
     coef, _, median_normal, _ = _fit_disparity_plane(disparity, fit_mask, normals)
     surface = surface_type if surface_type in ("floor", "wall") else _classify_surface(median_normal, coef, mask_bin)
+    if surface == "wall" and not WALL_PERSPECTIVE:
+        return wall_plane(h, w, roll)
 
     # Rigid orientation: a wall's inverse depth may only change along level lines (it is
     # vertical); a floor's only along the gravity direction (it is horizontal).
@@ -363,12 +405,8 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     segs = _detect_segments(gray, band)
 
     t, source = None, "fronto-parallel"
-    # Walls are rendered facing the camera, so courses are exactly level and columns exactly
-    # plumb in the image. Their yaw can't be recovered reliably: the disparity slope
-    # across a nearly frontal wall is dominated by Depth Anything's unknown shift (an office
-    # wall seen head-on came out yawed 36 deg, with courses sloping AGAINST the room's own
-    # lines), and the ceiling, AC units and furniture feed stray vanishing points.
-    if span > 1e-3 and (surface == "floor" or WALL_PERSPECTIVE):
+    # Reached by floors, and by walls only with WALL_PERSPECTIVE (see wall_plane).
+    if span > 1e-3:
         # Walls: how much perspective the depth map itself supports. On a nearly frontal
         # wall the disparity gradient is tiny, so any vanishing point gets huge leverage;
         # stray converging lines just off the wall (sofa backs, cushions) must not turn it
@@ -414,13 +452,9 @@ def estimate_geometry(room_np, disparity, mask_bin, surface_type="auto"):
     normal = np.array([f * horizon[0], f * horizon[1], cx * horizon[0] + cy * horizon[1] + horizon[2]])
     normal /= np.linalg.norm(normal)
 
-    # Floors: tile courses run away from the camera, around roll-corrected gravity.
-    # Walls: columns exactly image-vertical (0 deg). The roll read from the room's lines is
-    # unreliable on walls: in a bathroom photo whose window frame is perfectly vertical it
-    # read 4.2 deg, from lines leaning with camera pitch, and tilted the whole grid with it.
+    # Floors: tile courses run away from the camera. Walls (WALL_PERSPECTIVE only): tile
+    # columns follow roll-corrected gravity.
     gravity = np.array([down[0], down[1], 0.0])
-    if surface == "wall" and not WALL_PERSPECTIVE:
-        gravity = np.array([0.0, 1.0, 0.0])
     refs = [np.array([0.0, 0.0, 1.0]), gravity] if surface == "floor" else [gravity, np.array([0.0, 0.0, 1.0])]
     for ref in refs:
         e2 = ref - (ref @ normal) * normal
@@ -1040,8 +1074,14 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
     if mask_bin.sum() < 0.002 * h * w:
         raise ValueError("The selected surface is too small to tile.")
 
-    disparity = estimate_depth(room_np)
-    geo = estimate_geometry(room_np, disparity, mask_bin, surface_type)
+    override = None
+    if surface_type == "floor" and not plausible_floor(mask_bin):
+        # A forced "floor" on what can only be a wall gave walls a receding floor projection.
+        surface_type, override = "wall", "floor requested, but the selection lies in the upper frame: rendered as a wall"
+    if surface_type == "wall" and not WALL_PERSPECTIVE:
+        geo = wall_plane(h, w)                 # flat 2D mapping: no depth model, no vanishing points
+    else:
+        geo = estimate_geometry(room_np, estimate_depth(room_np), mask_bin, surface_type)
 
     ys, xs = np.nonzero(alpha > 0.01)
     x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
@@ -1095,6 +1135,8 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
     result[y0:y1, x0:x1] = composite(result[y0:y1, x0:x1], out, alpha[y0:y1, x0:x1])
     result = apply_mood(result, mood)
     info = {**geo.info, "pattern": pattern, "orientation_deg": orientation_deg, "mood": mood}
+    if override:
+        info["surface_override"] = override
     return np.clip(result, 0, 255).astype(np.uint8), info
 
 
