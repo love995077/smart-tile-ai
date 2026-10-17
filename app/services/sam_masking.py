@@ -15,7 +15,7 @@ STRAIGHT_MAX_FOREIGN = 1.0     # px of far-side-looking area per px of line befo
 STRAIGHT_MIN_SEPARATION = 10.0  # ...when the two sides differ clearly enough in colour (LAB) to judge
 # A selected surface covering less of the photo than this was most likely shot from far away:
 # tiles end up a few pixels wide and the grid reads as noise.
-DISTANCE_MIN_COVERAGE = 0.25
+DISTANCE_MIN_COVERAGE = 0.15
 
 
 def _guided_filter(guide, src, radius, eps):
