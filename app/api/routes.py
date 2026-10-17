@@ -18,7 +18,7 @@ from app.models.product import Product, ProductImage
 from app.services.color_harmony import recommend
 from app.services.quality_advisor import assess_quality
 from app.services.render_engine import MOODS, ORIENTATIONS, PATTERNS, render_surface
-from app.services.sam_masking import build_alpha_matte, make_overlay
+from app.services.sam_masking import build_alpha_matte, distance_check, make_overlay
 from app.services.segmentation import detect_surface
 from app.services.visual_search import CATALOG_FOLDER, find_matching_tiles
 
@@ -113,10 +113,12 @@ def get_mask(
         raise HTTPException(status_code=400, detail="Add at least one positive (left) click.")
 
     alpha, info = build_alpha_matte(room_np, positive, negative, auto_exclude=auto_exclude, straighten=straighten)
+    coverage, distance_warning = distance_check(alpha)
     return {
         "width": int(room_np.shape[1]),
         "height": int(room_np.shape[0]),
-        "coverage": round(float(alpha.mean()), 4),
+        "coverage": round(coverage, 4),
+        "distance_warning": distance_warning,
         "auto_excluded": info["objects"],
         "straightened_edges": int(info.get("straightened_edges", 0)),
         "mask": png_data_url((alpha * 255).astype(np.uint8)),

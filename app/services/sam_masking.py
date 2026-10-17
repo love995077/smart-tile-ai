@@ -13,6 +13,9 @@ EXCLUDED_COLOR = np.array([244, 63, 94], dtype=np.float32)   # rose-500: auto-ex
 STRAIGHT_MIN_SUPPORT = 0.02
 STRAIGHT_MAX_FOREIGN = 1.0     # px of far-side-looking area per px of line before a line is refused...
 STRAIGHT_MIN_SEPARATION = 10.0  # ...when the two sides differ clearly enough in colour (LAB) to judge
+# A selected surface covering less of the photo than this was most likely shot from far away:
+# tiles end up a few pixels wide and the grid reads as noise.
+DISTANCE_MIN_COVERAGE = 0.25
 
 
 def _guided_filter(guide, src, radius, eps):
@@ -635,6 +638,13 @@ def build_alpha_matte(image_np, positive_clicks, negative_clicks, auto_exclude=T
     haloed = _close_halo(image_np, binary, alpha, reach=max(6, int(round(max(h, w) * 0.009))))
     alpha = np.where(straight > 0, alpha, haloed)
     return cv2.GaussianBlur(alpha, (3, 3), 0).astype(np.float32), info
+
+
+def distance_check(alpha):
+    """(coverage, warning): the share of the photo the matte covers, and whether it is under
+    DISTANCE_MIN_COVERAGE, i.e. the photo was probably taken too far from the surface."""
+    coverage = float(alpha.mean()) if alpha.size else 0.0
+    return coverage, bool(alpha.any() and coverage < DISTANCE_MIN_COVERAGE)
 
 
 def make_overlay(image_np, alpha, excluded=None):

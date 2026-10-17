@@ -48,6 +48,11 @@ SHADING_DETAIL_FLOOR = 0.12   # crisp light changes weaker than this (log units,
 SHADING_GRID_CELLS = 640      # resolution of the top-down metric grid used for lighting
 CONTACT_SHADOW = (0.25, 0.07) # floors: (darkening right at an object's base, decay distance in metres)
 BEVEL = (0.10, 1.5)           # tile edges: (darkening next to the grout, width in mm)
+SURFACE_EXPOSURE = (0.25, 0.8, 1.15)  # light on the surface vs the rest of the photo: (share of the log ratio, min, max gain)
+DETAIL_TRANSFER = (0.10, 0.15)        # small-scale shadows from the photo (log units): (dead zone, max brightening)
+DETAIL_TEXTURE = (0.035, 0.07)        # fine-texture energy (log units) up to which they transfer fully / not at all
+DETAIL_MIN_M = 0.06                   # shadow detail smaller than this on the surface is grout, seams or veins
+GROUT_FADE_PX = (3.0, 14.0)           # floors: on-screen tile size (px) at which grout has faded out / starts to fade
 PATTERNS = ("standard", "brick", "herringbone", "checkerboard")
 ORIENTATIONS = (0.0, 90.0, 45.0)
 MOODS = {"natural": None, "warm": (3000.0, 0.92), "cool": (6500.0, 1.0)}   # (kelvin, exposure)
@@ -638,10 +643,20 @@ def tile_layout(um, vm, tile_w, tile_h, pattern="standard"):
     return TileLayout(np.mod(um, tile_w), np.mod(vm, tile_h), tile_w, tile_h)
 
 
-def render_tile_layer(tile_img, um, vm, tile_w_mm, tile_h_mm, grout_mm, pattern="standard", grout_rgb=None):
+def _smoothstep(lo, hi, x):
+    t = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def render_tile_layer(tile_img, um, vm, tile_w_mm, tile_h_mm, grout_mm, pattern="standard", grout_rgb=None,
+                      fade_far=False):
     """RGB float32 tiles at pattern-frame coordinates (um, vm) in mm: texture, analytic grout and edge bevel.
 
     grout_rgb: exact grout colour (sRGB 0-255), or None for a neutral grout tinted by the tile.
+    fade_far: fade grout and bevels to their average tone where tiles shrink below
+    GROUT_FADE_PX on screen (floors receding to the horizon). Exact box filtering keeps
+    each line correct, but dozens of 1px lines a few pixels apart still read as a dense,
+    shimmering mesh; a camera lens would already have softened them.
     """
     if pattern == "herringbone" and tile_h_mm > tile_w_mm:
         # Herringbone lays the long side along u; turn the photo so its long side matches.
@@ -682,19 +697,31 @@ def render_tile_layer(tile_img, um, vm, tile_w_mm, tile_h_mm, grout_mm, pattern=
     fa = (np.abs(dux) + np.abs(duy)) / lay.su
     fb = (np.abs(dvx) + np.abs(dvy)) / lay.sv
     ha, hb = 0.5 * grout_mm / lay.su, 0.5 * grout_mm / lay.sv
+    # Share of each axis' line contrast that survives (1 = crisp); fa is tiles per pixel.
+    keep_a = keep_b = 1.0
+    if fade_far:
+        lo, hi = GROUT_FADE_PX
+        keep_a = _smoothstep(lo, hi, 1.0 / np.maximum(fa, 1e-6))
+        keep_b = _smoothstep(lo, hi, 1.0 / np.maximum(fb, 1e-6))
 
     # Edge bevel: tiles darken slightly towards the grout; invisible once sub-pixel.
     strength, width_mm = BEVEL
     ea = np.maximum((np.abs(a - np.round(a)) - ha) * lay.su, 0)
     eb = np.maximum((np.abs(b - np.round(b)) - hb) * lay.sv, 0)
-    va = np.clip(width_mm / np.maximum(fa * lay.su, 1e-6), 0, 1)
-    vb = np.clip(width_mm / np.maximum(fb * lay.sv, 1e-6), 0, 1)
+    va = np.clip(width_mm / np.maximum(fa * lay.su, 1e-6), 0, 1) * keep_a
+    vb = np.clip(width_mm / np.maximum(fb * lay.sv, 1e-6), 0, 1) * keep_b
     dark = np.maximum(np.exp(-ea / width_mm) * va, np.exp(-eb / width_mm) * vb)
     rgb *= (1.0 - strength * dark)[..., None].astype(np.float32)
 
     if grout_mm <= 0:
         return rgb
-    cov = 1.0 - (1.0 - _line_coverage(a, ha, fa)) * (1.0 - _line_coverage(b, hb, fb))
+    ca, cb = _line_coverage(a, ha, fa), _line_coverage(b, hb, fb)
+    if fade_far:
+        # Towards the average coverage, so the far floor keeps its overall tone.
+        avg_a, avg_b = np.minimum(2 * ha, 1.0), np.minimum(2 * hb, 1.0)
+        ca = avg_a + (ca - avg_a) * keep_a
+        cb = avg_b + (cb - avg_b) * keep_b
+    cov = 1.0 - (1.0 - ca) * (1.0 - cb)
     if grout_rgb is None:
         # Grout picks up the tile's tint and sits recessed, so slightly darker.
         grout = (0.35 * texture.reshape(-1, 3).mean(0) + 0.65 * np.array([190.0, 186.0, 180.0])) * 0.72
@@ -832,7 +859,7 @@ def _shading_from_grid(log_lum, size):
     return (low + high).astype(np.float32)
 
 
-def illumination_map(room_np, alpha, geo, u, v, bbox):
+def illumination_map(room_np, alpha, geo, u, v, bbox, with_detail=False):
     """Shading ratio (1.0 = typical light on the surface) for the bbox, free of old-tile texture.
 
     Intrinsic split: luminance = albedo x shading. Old tiles shrink with distance, so a
@@ -842,12 +869,16 @@ def illumination_map(room_np, alpha, geo, u, v, bbox):
     everything smaller than SHADING_FOOTPRINT_M is removed and room-scale light (window
     falloff, furniture shadows, sun patches) is kept (see _shading_from_grid). The
     result is mapped back per pixel.
+
+    with_detail: return (shading, detail, weight), adding the small-scale shadows of
+    _shadow_detail_grid as a multiplier and their per-pixel transfer weight.
     """
     x0, y0, x1, y1 = bbox
     surface = alpha > 0.5
     sub = surface[y0:y1, x0:x1]
     if sub.sum() < 50:
-        return np.ones(u.shape, np.float32)
+        flat = np.ones(u.shape, np.float32)
+        return (flat, flat, np.zeros(u.shape, np.float32)) if with_detail else flat
 
     L = cv2.cvtColor(room_np, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32) / 255.0
     log_lum = np.log(np.power((L * 100.0 + 16.0) / 116.0, 3.0) + 1e-3).astype(np.float32)
@@ -875,13 +906,84 @@ def illumination_map(room_np, alpha, geo, u, v, bbox):
         core = surface.astype(np.uint8)
     valid = cv2.remap(core.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR,
                       borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.5
-    filtered = _shading_from_grid(_fill_invalid(grid, valid), max(3, int(round(SHADING_FOOTPRINT_M / cell))))
+    filled = _fill_invalid(grid, valid)
+    size = max(3, int(round(SHADING_FOOTPRINT_M / cell)))
+    filtered = _shading_from_grid(filled, size)
 
     gx = ((u - u_lo) / cell).astype(np.float32)
     gy = ((v - v_lo) / cell).astype(np.float32)
     shading = cv2.remap(filtered, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     ref = np.percentile(shading[sub], 60)
-    return np.clip(np.exp(shading - ref), 0.04, 3.0).astype(np.float32)
+    norm = np.clip(np.exp(shading - ref), 0.04, 3.0).astype(np.float32)
+    if not with_detail:
+        return norm
+
+    h, w = alpha.shape
+    on_surface = cv2.remap(surface.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.5
+    in_frame = (map_x >= 0) & (map_x <= w - 1) & (map_y >= 0) & (map_y <= h - 1)
+    log_detail, weight = _shadow_detail_grid(filled, filtered, valid, on_surface, in_frame & ~on_surface, cell, size)
+    detail = np.exp(cv2.remap(log_detail, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE))
+    weight = cv2.remap(weight, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return norm, detail.astype(np.float32), np.clip(weight, 0, 1).astype(np.float32)
+
+
+def _shadow_detail_grid(filled, filtered, valid, on_surface, occluder, cell, size):
+    """Small-scale shadows on the metric grid: (log multiplier, transfer weight).
+
+    _shading_from_grid keeps only light patterns larger than SHADING_FOOTPRINT_M, because
+    anything smaller could be the old surface's own pattern, so the soft shadow under a
+    chair, the darkening into a corner or along a skirting board was lost. Here the band
+    between DETAIL_MIN_M and the footprint comes back, as a Multiply blend in linear light,
+    but only where it can only be light:
+      - features under DETAIL_MIN_M (grout lines, plank seams, veins, specks) are removed
+        first with the same morphological filter;
+      - `weight` fades the transfer out where the old surface is textured: 1 below
+        DETAIL_TEXTURE[0] of fine-texture energy, 0 above DETAIL_TEXTURE[1];
+      - only light or dark regions touching an occluder (an object, the wall at the floor's
+        edge) are kept. A cast or contact shadow starts at what casts it; a stain or a
+        darker old tile in the open floor is an isolated blob, i.e. albedo;
+      - changes within DETAIL_TRANSFER's dead zone are mottling; brightening is capped.
+    """
+    if valid.sum() < 50:
+        return np.zeros(filled.shape, np.float32), np.zeros(filled.shape, np.float32)
+    mid = _remove_small_features(filled, max(3, int(round(DETAIL_MIN_M / cell))))
+    vf = valid.astype(np.float32)
+    sigma = max(1.0, size / 2.0)
+    energy = (cv2.GaussianBlur(np.abs(filled - mid) * vf, (0, 0), sigma)
+              / np.maximum(cv2.GaussianBlur(vf, (0, 0), sigma), 1e-3))
+    lo, hi = DETAIL_TEXTURE
+    weight = np.clip((hi - energy) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+    d = mid - filtered
+    d = d - np.median(d[valid])                    # the surface's own tone is the baseline
+    dead, up = DETAIL_TRANSFER
+    d = np.minimum(np.sign(d) * np.maximum(np.abs(d) - dead, 0.0), up)
+    reach = cv2.dilate(occluder.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    keep = np.zeros(d.shape, bool)
+    for part in (d < 0, d > 0):
+        n, labels = cv2.connectedComponents((part & on_surface).astype(np.uint8), connectivity=8)
+        if n > 1:
+            ids = np.unique(labels[reach & (labels > 0)])
+            keep |= np.isin(labels, ids[ids > 0])
+    return np.where(keep, weight * d, 0.0).astype(np.float32), weight
+
+
+def surface_exposure(room_np, alpha):
+    """Exposure gain from how much light the selected surface gets compared with the rest of the photo.
+
+    Shading is normalised to the surface's own typical light, so a wall in deep shade and
+    one in full sun would otherwise get equally bright tiles. The ratio of the log-mean
+    luminance inside the matte to the log-mean outside it measures that light, but also
+    the old material's colour (a black floor reads as "dim", a white wall as "bright"),
+    so only SURFACE_EXPOSURE's share of the ratio is applied, within its bounds.
+    """
+    lum = np.log(srgb_to_linear(cv2.cvtColor(room_np, cv2.COLOR_RGB2GRAY).astype(np.float32)) + 1e-3)
+    inside, outside = alpha > 0.5, alpha < 0.05
+    if inside.sum() < 50 or outside.sum() < 50:
+        return 1.0
+    share, lo, hi = SURFACE_EXPOSURE
+    return float(np.clip(np.exp(share * (lum[inside].mean() - lum[outside].mean())), lo, hi))
 
 
 def contact_shadow(alpha, u, v, bbox):
@@ -1088,9 +1190,13 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
     bbox = (x0, y0, x1, y1)
     u, v, view_cos = plane_coordinates(geo, x0, y0, x1, y1)
 
-    shading = illumination_map(room_np, alpha, geo, u, v, bbox)
+    shading, detail, transfer = illumination_map(room_np, alpha, geo, u, v, bbox, with_detail=True)
     if geo.surface == "floor":
-        shading *= contact_shadow(alpha, u, v, bbox)
+        # The synthetic contact shadow stands in for the real one only where the photo's
+        # own small-scale shadows are not transferred (patterned old floors).
+        ao = contact_shadow(alpha, u, v, bbox)
+        shading *= 1.0 - (1.0 - ao) * (1.0 - transfer)
+    shading *= detail
 
     # Anchor the grid on the nearest part of the surface, so the foreground shows a whole tile.
     my, mx = np.nonzero(mask_bin[y0:y1, x0:x1])
@@ -1107,9 +1213,11 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
         du, dv = c * du + s * dv, -s * du + c * dv
     um, vm = du + 0.5 * tile_w, dv
     tile_img = fit_tile_aspect(prepare_tile_image(tile_np), tile_w_mm, tile_h_mm)
-    tiles = render_tile_layer(tile_img, um, vm, tile_w, tile_h, grout_mm * scale, pattern=pattern, grout_rgb=grout_rgb)
+    tiles = render_tile_layer(tile_img, um, vm, tile_w, tile_h, grout_mm * scale, pattern=pattern, grout_rgb=grout_rgb,
+                              fade_far=geo.surface == "floor")
     tiles = cv2.GaussianBlur(tiles, (0, 0), 0.35)   # a touch of camera optics; filtering handles aliasing
-    base = srgb_to_linear(tiles) * scene_exposure(room_np)
+    gain = surface_exposure(room_np, alpha)
+    base = srgb_to_linear(tiles) * (scene_exposure(room_np) * gain)
     if is_glossy:
         # More highlight headroom plus a capped white sheen where the room is brightest.
         lit_shading = compress_highlights(shading, HIGHLIGHT_HEADROOM[1])
@@ -1134,7 +1242,9 @@ def render_surface(room_np, tile_np, alpha, tile_w_mm=600.0, tile_h_mm=600.0, sc
     result = room_np.astype(np.float32)
     result[y0:y1, x0:x1] = composite(result[y0:y1, x0:x1], out, alpha[y0:y1, x0:x1])
     result = apply_mood(result, mood)
-    info = {**geo.info, "pattern": pattern, "orientation_deg": orientation_deg, "mood": mood}
+    inside = alpha[y0:y1, x0:x1] > 0.5
+    info = {**geo.info, "pattern": pattern, "orientation_deg": orientation_deg, "mood": mood,
+            "exposure_gain": round(gain, 3), "shadow_transfer": round(float(transfer[inside].mean()), 2)}
     if override:
         info["surface_override"] = override
     return np.clip(result, 0, 255).astype(np.uint8), info

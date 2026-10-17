@@ -55,6 +55,8 @@ const state = {
 };
 
 // ---------------------------------------------------------------- utilities
+const DISTANCE_WARNING = 'Photo seems taken from far away. For best details and grid scale, try capturing closer to the surface.';
+
 function toast(msg, ms = 4200) {
   const t = $('toast');
   t.textContent = msg;
@@ -455,6 +457,11 @@ async function requestMask() {
     state.excludedSummary = data.auto_excluded || {};
     state.straightened = data.straightened_edges || 0;
     draw();
+    // Once per photo: a small surface means tiny tiles and a noisy grid.
+    if (data.distance_warning && state.distanceWarnedFor !== state.roomBlob) {
+      state.distanceWarnedFor = state.roomBlob;
+      toast(DISTANCE_WARNING, 7000);
+    }
   } catch (e) {
     if (seq === state.maskSeq) toast(`Segmentation failed: ${e.message}`);
   } finally {
@@ -1022,6 +1029,7 @@ async function openCamera() {
   $('cam-shutter').disabled = true;
   $('cam-status').textContent = 'Starting camera…';
   $('cam-readout').textContent = '';
+  $('cam-hint').textContent = '';
   try {
     cam.stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1440 } }, audio: false,
@@ -1061,8 +1069,11 @@ function showCameraError(text) {
   $('cam-status').textContent = 'Camera unavailable';
 }
 
+const FILL_HINT = 'Ensure the surface fills the frame';
+
 function levelUnavailable(text) {
   $('cam-status').textContent = `${text} · frame the floor or wall at chest height`;
+  $('cam-hint').textContent = FILL_HINT;
   $('cam-status').className = 'rounded-full bg-black/60 backdrop-blur px-4 py-2 text-sm font-medium text-center max-w-[92%]';
   $('level-line').style.background = 'rgba(255,255,255,.7)';
 }
@@ -1115,6 +1126,7 @@ function updateLevel(beta, gamma) {
   $('pitch-bubble').style.background = colors[status];
   const s = $('cam-status');
   s.textContent = status === 'good' ? 'Perfect Angle — Ready to Capture' : 'Tilt Warning: Hold phone straight at chest height for best results';
+  $('cam-hint').textContent = FILL_HINT;
   s.className = `rounded-full backdrop-blur px-4 py-2 text-sm font-medium text-center max-w-[92%] ${status === 'good' ? 'bg-emerald-500/85' : status === 'warn' ? 'bg-yellow-500/85 text-black' : 'bg-red-500/85'}`;
   $('cam-readout').textContent = `Tilt ${Math.round(pitchDown)}° ${pitchDown >= 0 ? 'down' : 'up'} · Roll ${Math.round(roll)}°`;
 }

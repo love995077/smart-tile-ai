@@ -50,6 +50,13 @@
       linear-gradient(to right, transparent calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% + .5px), transparent calc(33.333% + .5px), transparent calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% + .5px), transparent calc(66.666% + .5px)),
       linear-gradient(to bottom, transparent calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% - .5px), rgba(255,255,255,.45) calc(33.333% + .5px), transparent calc(33.333% + .5px), transparent calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% - .5px), rgba(255,255,255,.45) calc(66.666% + .5px), transparent calc(66.666% + .5px)); }
     .level-line { transition: transform .08s linear, background-color .2s; }
+    /* Viewfinder: the area the surface should fill; the rest of the frame is dimmed a little. */
+    .viewfinder { box-shadow: 0 0 0 100vmax rgba(0,0,0,.22); }
+    .viewfinder::before { content: ""; position: absolute; inset: -2px; border: 3px solid rgba(255,255,255,.9); border-radius: 14px;
+      -webkit-mask: linear-gradient(#000 0 0) top left / 28px 28px no-repeat, linear-gradient(#000 0 0) top right / 28px 28px no-repeat,
+                    linear-gradient(#000 0 0) bottom left / 28px 28px no-repeat, linear-gradient(#000 0 0) bottom right / 28px 28px no-repeat;
+              mask: linear-gradient(#000 0 0) top left / 28px 28px no-repeat, linear-gradient(#000 0 0) top right / 28px 28px no-repeat,
+                    linear-gradient(#000 0 0) bottom left / 28px 28px no-repeat, linear-gradient(#000 0 0) bottom right / 28px 28px no-repeat; }
     @media (prefers-reduced-motion: reduce) { .orbit, .shimmer { animation: none; } .level-line { transition: none; } }
   </style>
 </head>
@@ -367,7 +374,9 @@
 <div id="camera-modal" class="hidden fixed inset-0 z-50 bg-black text-white flex flex-col" role="dialog" aria-modal="true" aria-label="Take a room photo">
   <div class="relative flex-1 min-h-0 overflow-hidden">
     <video id="cam-video" playsinline autoplay muted class="absolute inset-0 h-full w-full object-contain"></video>
-    <div id="cam-frame" class="absolute inset-0 pointer-events-none">
+    <div id="cam-frame" class="absolute inset-0 pointer-events-none overflow-hidden">
+    <!-- viewfinder: ~55% of the picture; a surface filling it clears the far-away check -->
+    <div id="cam-viewfinder" class="viewfinder absolute left-[13%] top-[13%] w-[74%] h-[74%] rounded-xl border border-white/45" aria-hidden="true"></div>
     <div class="cam-grid absolute inset-0"></div>
     <!-- crosshair -->
     <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
@@ -380,6 +389,9 @@
       <div class="h-px w-full bg-white/30"></div>
       <div id="level-line" class="level-line absolute left-0 top-0 h-[3px] -mt-px w-full rounded-full bg-white/70 shadow"></div>
     </div>
+    <div class="absolute inset-x-0 top-[calc(50%+2.75rem)] flex justify-center px-3">
+      <span class="rounded-full bg-black/55 backdrop-blur px-3 py-1 text-xs font-medium text-white/95">Fit the wall/floor inside this frame.</span>
+    </div>
     <!-- pitch bubble (right edge): centred band = chest-height range -->
     <div class="absolute right-3 top-1/2 -translate-y-1/2 h-40 w-3 rounded-full bg-white/15 pointer-events-none" aria-hidden="true">
       <div class="absolute inset-x-0 top-[38%] h-[24%] rounded-full bg-emerald-400/30"></div>
@@ -389,6 +401,7 @@
     <div class="absolute top-0 inset-x-0 p-3 flex flex-col items-center gap-2" style="padding-top: max(.75rem, env(safe-area-inset-top));">
       <div id="cam-status" class="rounded-full bg-black/60 backdrop-blur px-4 py-2 text-sm font-medium text-center max-w-[92%]">Starting camera…</div>
       <div id="cam-readout" class="text-xs text-white/70 tabular-nums"></div>
+      <div id="cam-hint" class="text-xs text-white/85" aria-live="polite"></div>
     </div>
     <div id="cam-error" class="hidden absolute inset-0 grid place-items-center p-6 text-center">
       <div class="max-w-sm">
